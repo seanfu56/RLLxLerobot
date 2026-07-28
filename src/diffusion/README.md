@@ -113,6 +113,7 @@ Every evaluation also generates held-out MP4 previews with the EMA weights:
 
 ```text
 models/video_diffusion/pick-can-all/base/eval/step_0001000/sample_00_56.mp4
+models/video_diffusion/pick-can-all/base/eval/step_0001000/sample_00_56_frames.png
 models/video_diffusion/pick-can-all/base/eval/step_0001000/reference_00_56.mp4
 models/video_diffusion/pick-can-all/base/eval/step_0001000/condition_00_56.png
 models/video_diffusion/pick-can-all/superres/eval/step_0001000/sample_00_224.mp4
@@ -131,6 +132,9 @@ or swaps RGB/BGR channels. The condition is also saved separately as PNG, and
 the real held-out four-frame sequence is saved as `reference_*.mp4`. Playback
 defaults to 1 FPS because these are four sparse trajectory states, making the
 fixed first frame visible for a full second.
+
+The four generated frames are also concatenated left-to-right into
+`sample_*_frames.png` for viewing the entire trajectory at once.
 
 Control preview generation with:
 

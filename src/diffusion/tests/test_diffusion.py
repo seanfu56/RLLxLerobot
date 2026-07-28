@@ -20,7 +20,7 @@ from diffusion.diffusion import GaussianDiffusion
 from diffusion.image_model import ImageUNet, ImageUNetConfig
 from diffusion.model import VideoUNet, VideoUNetConfig
 from diffusion.train import stage_tensors
-from diffusion.video_io import write_mp4
+from diffusion.video_io import write_frame_strip, write_mp4
 
 
 def small_model(*, condition_channels: int = 0) -> VideoUNet:
@@ -200,6 +200,18 @@ class DiffusionTests(unittest.TestCase):
         self.assertGreater(means[0], 200)
         self.assertLess(means[1], 30)
         self.assertLess(means[2], 30)
+
+    def test_frame_strip_places_four_frames_left_to_right(self) -> None:
+        video = torch.zeros(3, 4, 16, 16)
+        video[:, 0] = torch.tensor([1.0, -1.0, -1.0])[:, None, None]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frames.png"
+            write_frame_strip(path, video)
+            strip_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        self.assertEqual(strip_bgr.shape, (16, 64, 3))
+        strip_rgb = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2RGB)
+        self.assertGreater(float(strip_rgb[:, :16, 0].mean()), 250)
+        self.assertLess(float(strip_rgb[:, :16, 1:].mean()), 5)
 
 
 if __name__ == "__main__":

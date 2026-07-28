@@ -45,7 +45,7 @@ if __package__ in (None, ""):
     from diffusion.diffusion import GaussianDiffusion
     from diffusion.image_model import ImageUNet, ImageUNetConfig
     from diffusion.model import VideoUNet, VideoUNetConfig
-    from diffusion.video_io import write_mp4, write_png
+    from diffusion.video_io import write_frame_strip, write_mp4, write_png
 else:
     from .data import (
         GENERATED_FRAMES,
@@ -61,7 +61,7 @@ else:
     from .diffusion import GaussianDiffusion
     from .image_model import ImageUNet, ImageUNetConfig
     from .model import VideoUNet, VideoUNetConfig
-    from .video_io import write_mp4, write_png
+    from .video_io import write_frame_strip, write_mp4, write_png
 
 
 class ExponentialMovingAverage:
@@ -492,6 +492,7 @@ def save_evaluation_videos(
     paths: list[str] = []
     reference_paths: list[str] = []
     condition_paths: list[str] = []
+    frame_strip_paths: list[str] = []
     if not (len(videos) == len(references) == len(frame_indices)):
         raise ValueError("Evaluation videos, references, and frame indices must have equal lengths")
     for index, (video, reference) in enumerate(zip(videos, references, strict=True)):
@@ -505,12 +506,15 @@ def save_evaluation_videos(
         path = output_dir / f"sample_{index:02d}_{resolution}.mp4"
         reference_path = output_dir / f"reference_{index:02d}_{resolution}.mp4"
         condition_path = output_dir / f"condition_{index:02d}_{resolution}.png"
+        frame_strip_path = output_dir / f"sample_{index:02d}_{resolution}_frames.png"
         write_mp4(path, video, fps)
         write_mp4(reference_path, reference, fps)
         write_png(condition_path, reference[:, 0])
+        write_frame_strip(frame_strip_path, video)
         paths.append(str(path))
         reference_paths.append(str(reference_path))
         condition_paths.append(str(condition_path))
+        frame_strip_paths.append(str(frame_strip_path))
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "samples.json").write_text(
         json.dumps(
@@ -521,6 +525,7 @@ def save_evaluation_videos(
                 "videos": paths,
                 "references": reference_paths,
                 "conditions": condition_paths,
+                "frame_strips": frame_strip_paths,
             },
             indent=2,
         ),

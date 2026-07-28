@@ -37,6 +37,20 @@ def write_png(path: Path, image: torch.Tensor) -> None:
         raise RuntimeError(f"Could not write PNG: {path}")
 
 
+def write_frame_strip(path: Path, video: torch.Tensor) -> None:
+    """Save ``C x T x H x W`` frames as one left-to-right RGB PNG."""
+    if video.ndim != 4 or video.shape[0] != 3:
+        raise ValueError(f"Expected CxTxHxW RGB video, got {tuple(video.shape)}")
+    frames = [normalized_rgb(video[:, index]) for index in range(video.shape[1])]
+    strip_rgb = np.concatenate(frames, axis=1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(
+        str(path),
+        cv2.cvtColor(np.ascontiguousarray(strip_rgb), cv2.COLOR_RGB2BGR),
+    ):
+        raise RuntimeError(f"Could not write frame strip: {path}")
+
+
 def verify_mp4(path: Path, expected_video: torch.Tensor) -> None:
     """Decode an MP4 and verify shape plus its first frame and RGB channel order."""
     expected_frames = expected_video.shape[1]
