@@ -138,18 +138,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data.add_argument("--output-root", type=Path, default=Path("models/simple"))
     data.add_argument("--run-name", default=None, help="Defaults to <bundle>_simple_h<horizon>")
     data.add_argument("--val-episodes", type=int, default=3, help="Held-out episodes per source (0 disables)")
-    data.add_argument("--num-workers", type=int, default=6)
+    data.add_argument("--num-workers", type=int, default=8)
     data.add_argument("--overwrite", action="store_true")
 
     shape = parser.add_argument_group("horizons")
     shape.add_argument("--horizon", type=int, default=16, help="Actions predicted per forward pass")
-    shape.add_argument("--n-obs-steps", type=int, default=2, help="Observation frames fed in (2 encodes velocity)")
+    shape.add_argument("--n-obs-steps", type=int, default=1, help="Observation frames fed in (2 encodes velocity)")
     shape.add_argument("--n-action-steps", type=int, default=8, help="Actions executed before re-planning")
     shape.add_argument("--drop-n-last-frames", type=int, default=None,
                        help="Default: horizon - n_action_steps - n_obs_steps + 1")
 
     arch = parser.add_argument_group("architecture")
-    arch.add_argument("--down-dims", type=int, nargs="+", default=[128, 256, 512],
+    arch.add_argument("--down-dims", type=int, nargs="+", default=[64, 128, 256],
                       help="U-Net stage widths. 17M params at the default, 5M at 64 128 256")
     arch.add_argument("--kernel-size", type=int, default=5)
     arch.add_argument("--n-groups", type=int, default=8)
@@ -165,7 +165,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                       help="FiLM bias only, no scale")
 
     objective = parser.add_argument_group("objective")
-    objective.add_argument("--objective", choices=OBJECTIVES, default="diffusion",
+    objective.add_argument("--objective", choices=OBJECTIVES, default="flow",
                            help="diffusion: DDPM training, epsilon prediction, DDIM sampling. "
                                 "flow: rectified flow, velocity prediction, Euler sampling")
     objective.add_argument("--num-inference-steps", type=int, default=10,
@@ -187,7 +187,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     objective.add_argument("--guidance-weight", type=float, default=1.0,
                            help="Guidance used at validation and stored as the checkpoint's default. "
                                 "1.0 is plain conditional sampling; needs --cond-dropout above 0")
-    objective.add_argument("--action-repr", choices=ACTION_REPRS, default="absolute",
+    objective.add_argument("--action-repr", choices=ACTION_REPRS, default="delta",
                            help="absolute: predict joint targets. delta: predict them relative to the state")
     objective.add_argument("--delta-mode", choices=DELTA_MODES, default="incremental")
     objective.add_argument("--absolute-dims", nargs="*", default=None, metavar="DIM",
@@ -209,7 +209,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                            "is how to measure what the goal is contributing")
 
     optimization = parser.add_argument_group("optimisation")
-    optimization.add_argument("--steps", type=int, default=18000)
+    optimization.add_argument("--steps", type=int, default=6000)
     optimization.add_argument("--batch-size", type=int, default=64)
     optimization.add_argument("--lr", type=float, default=1e-4)
     optimization.add_argument("--min-lr", type=float, default=1e-6)
@@ -218,7 +218,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     optimization.add_argument("--grad-clip", type=float, default=1.0)
     optimization.add_argument("--ema-decay", type=float, default=0.999, help="0 disables EMA")
     optimization.add_argument("--no-augment", dest="augment", action="store_false")
-    optimization.add_argument("--crop-scale", type=float, default=0.9,
+    optimization.add_argument("--crop-scale", type=float, default=1.0,
                               help="Lower bound of the random crop. 1.0 disables cropping")
     optimization.add_argument("--color-jitter", type=float, default=0.1)
     optimization.add_argument("--amp", choices=("bf16", "fp16", "off"), default="bf16")
