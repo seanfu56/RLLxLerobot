@@ -126,7 +126,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     data.add_argument(
         "--val-videos", type=int, default=6, help="Whole episodes held out for validation"
     )
-    data.add_argument("--num-workers", type=int, default=4)
+    data.add_argument("--num-workers", type=int, default=8)
 
     architecture = parser.add_argument_group("architecture")
     architecture.add_argument(
@@ -169,9 +169,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     optimization = parser.add_argument_group("optimization")
-    optimization.add_argument("--steps", type=int, default=100_000)
+    optimization.add_argument("--steps", type=int, default=60_000)
     optimization.add_argument(
-        "--batch-size", type=int, default=None, help="Default: 4 for base, 1 for superres"
+        "--batch-size", type=int, default=8, help="Default: 8 for base, 1 for superres"
     )
     optimization.add_argument(
         "--grad-accumulation",
