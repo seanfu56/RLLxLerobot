@@ -284,9 +284,29 @@ class PolicySettingsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             PolicySettings(checkpoint=Path("/nonexistent/best.pt"))
 
+    def test_rejects_a_goal_image_that_is_not_there(self) -> None:
+        # Better here than three minutes later, in the child process, with the
+        # arm already enabled.
+        with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
+            with self.assertRaises(ValueError) as error:
+                PolicySettings(checkpoint=Path(handle.name), goal_image=Path("/nonexistent/goal.png"))
+            self.assertIn("Goal image", str(error.exception))
+
     def test_start_pose_must_cover_every_joint(self) -> None:
         with self.assertRaises(ValueError):
             runtime_config(start_pose={"joint_1.pos": 0.0})
+
+
+class PolicyHeadlineTest(unittest.TestCase):
+    def test_a_goal_conditioned_policy_says_whether_it_has_a_goal(self) -> None:
+        # Running a goal-conditioned policy against its null embedding is legal
+        # but rarely intended, so it has to be visible without opening a panel.
+        without = fake_policy_info(goal_conditioned=True, has_goal=False)
+        self.assertIn("no goal", without.headline())
+        self.assertIn("goal set", fake_policy_info(goal_conditioned=True, has_goal=True).headline())
+
+    def test_a_plain_policy_says_nothing_about_goals(self) -> None:
+        self.assertNotIn("goal", fake_policy_info().headline())
 
 
 class GuidanceWeightTest(unittest.TestCase):

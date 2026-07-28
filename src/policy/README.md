@@ -7,7 +7,9 @@ bundle of ~20 episodes rather than for a large multi-task dataset.
 
 That network is trained under one of two generative objectives, picked with
 `--objective`: **diffusion** (DDPM/DDIM, the default) or **flow** (rectified
-flow). See [Objectives](#objectives).
+flow). See [Objectives](#objectives). `--goal-conditioned` additionally feeds it
+a picture of how the episode should end; see
+[Goal conditioning](#goal-conditioning).
 
 ## Why this architecture
 
@@ -45,12 +47,34 @@ nothing in the tree can build the architecture. Their `run.json` and `log.jsonl`
 still read fine, so `sweeps/collect_results.py` continues to report their
 metrics, and the checkpoint picker refuses them with an explanation.
 
-## Train
+## Prepare the data
 
-Bundles come from `data_prep.py`; nothing new to prepare.
+Raw teleop recordings live in `piper-data/raw/<task>/episode_XXX/`. Decode them
+once into `piper-data/dataset/` — training reads that, never the MP4s:
 
 ```bash
-python src/policy/train.py --bundle pick-bar --run-name S_pick_bar
+python src/policy/data_prep.py --list          # what is on disk
+python src/policy/data_prep.py                 # one bundle per task directory
+python src/policy/data_prep.py --bundles pick-can-m1
+```
+
+Each task directory becomes a *shard* (the decoded pixels, under `_shards/`) and
+a *bundle* (a manifest pointing at shards). A new recording session needs no
+code change; only a bundle that **merges** sessions does, via `BUNDLE_SPECS` in
+`data_prep.py`:
+
+```python
+BUNDLE_SPECS = {"pick-can-all": ("pick-can-m1", "pick-can-m2")}
+```
+
+Merged bundles are a few kilobytes — they reference the shards rather than
+copying them, and re-running the script reuses any shard already decoded at the
+same `--image-size`. Pass `--force` to re-decode.
+
+## Train
+
+```bash
+python src/policy/train.py --bundle pick-can-m1 --run-name S_pick_can
 ```
 
 Defaults are the published recipe (horizon 16, 2 observation frames, execute 8,
@@ -127,6 +151,68 @@ prints a warning rather than silently doing nothing.
 The default stays diffusion. It is the published recipe, every checkpoint in
 `models/simple` was trained under it, and flow matching on 20 episodes is not a
 combination with much published evidence behind it.
+
+## Goal conditioning
+
+`--goal-conditioned` adds one more image to what the policy sees: a picture of
+how the episode should end. It is encoded by the same ResNet and appended to the
+conditioning vector — the U-Net, the objective, the action representation and
+the sampler are untouched. The implementation is in
+[`goal.py`](goal.py), separately from the plain policy.
+
+```bash
+python src/policy/train.py --bundle pick-can-all --run-name G_pick_can \
+    --goal-conditioned --goal-dropout 0.1
+```
+
+**Which frame is the goal.** One drawn uniformly from the last `--goal-window`
+frames (10 by default) of the episode the sample came from, redrawn each epoch.
+Not the final frame alone: the arm is still settling over the last half second,
+so the tail is a set of pictures that all mean "done", and training against a
+fresh draw stops the policy keying on one exact pixel arrangement. Nothing needs
+labelling — the goal is *hindsight*, read off demonstrations you already have.
+Validation pins it to the final frame instead, because a goal that moves between
+evaluations makes `val_loss` noisy and `val_loss` selects `best.pt`.
+
+Under augmentation the goal shares the observation stack's crop box, for the
+same reason the two observation frames do: the camera is static, so cropping the
+goal separately would shift the target relative to what the policy is looking at.
+
+**Whether it will help you.** Often not. Every episode of `pick-can-m1` ends in
+nearly the same picture, so the goal carries almost nothing the policy could not
+infer from the task itself, and it will learn to ignore it — at the cost of one
+extra ResNet pass per prediction. Goal conditioning starts paying when one
+bundle holds several end states: two objects, two placements, `pick-can-all`
+rather than one session. Train with `--goal-dropout 0.1` and measure the
+difference rather than assuming it:
+
+```bash
+python src/policy/infer.py --checkpoint models/simple/G_pick_can/best.pt \
+    --bundle pick-can-all --episode 0            # goal = the episode's last frame
+python src/policy/infer.py --checkpoint models/simple/G_pick_can/best.pt \
+    --bundle pick-can-all --episode 0 --no-goal  # same weights, null embedding
+```
+
+If the two ratios match, the goal is decoration. `--goal-dropout` is what makes
+that comparison possible at all: it trains a null-goal embedding, so the same
+checkpoint can run with no goal. It is separate from `--cond-dropout`, which
+drops the *whole* conditioning vector, goal included, and is what
+classifier-free guidance needs.
+
+Both of those numbers are optimistic in the same way: validation and replay hand
+the policy a goal taken from the very episode it is being scored on, which is
+the cleanest goal it will ever get. On the arm you supply a photo from a
+different attempt, lit slightly differently, with the object somewhere slightly
+else. Treat the offline gap as an upper bound on what the goal buys you.
+
+**On the arm.** A goal-conditioned checkpoint needs a goal frame at every step,
+so the Streamlit page grows a **Goal image** field next to the checkpoint
+picker — point it at a photo of the finished task taken from the same camera; a
+frame grabbed from a successful rollout is exactly right. The goal is fixed for
+the rollout and survives `reset`, since it describes the task rather than the
+attempt. Loading a goal-conditioned checkpoint through the plain `PolicyRunner`
+fails with an explanation rather than a state-dict error; `policy.goal.load_runner`
+picks the right class from the config.
 
 ### Reading the validation output
 
@@ -252,6 +338,7 @@ datasets.py      Bundle, ChunkDataset (observation history), compute_stats
 backbones.py     ImageNormalizer, SpatialSoftmax, BatchNorm -> GroupNorm
 modules.py       Normalizer, the timestep embedding
 objectives.py    DiffusionObjective (DDPM/DDIM), FlowMatchingObjective (rectified flow)
+goal.py          goal-conditioned dataset, policy and runner
 train.py         training loop, EMA, validation                [CLI]
 infer.py         offline replay and latency measurement        [CLI]
 inference.py     PolicyRunner, the on-robot interface

@@ -18,6 +18,12 @@ Two modes, neither of which touches hardware:
 
 The commanded joint targets are compared against the recording and against a
 policy that just holds the current pose. A ratio below 1 beats standing still.
+
+A goal-conditioned checkpoint (``--goal-conditioned``, see ``policy/goal.py``)
+replays against the last frame of the episode unless ``--goal-image`` names
+another one. If it was trained with ``--goal-dropout``, ``--no-goal`` scores the
+same checkpoint with no goal at all, and the gap between the two is what the
+goal is actually worth.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from policy.datasets import Bundle  # noqa: E402
+from policy.goal import load_runner  # noqa: E402
 from policy.inference import PolicyRunner  # noqa: E402
 
 
@@ -53,9 +60,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "Several values replay the episode once per weight and rank them, which "
                              "is how to pick one without touching the arm")
 
+    goal = parser.add_argument_group("goal conditioning")
+    goal.add_argument("--goal-image", type=Path, default=None, metavar="PATH",
+                      help="Goal frame for a --goal-conditioned checkpoint. Default in replay: "
+                           "the last frame of the replayed episode, which is what validation used")
+    goal.add_argument("--no-goal", action="store_true",
+                      help="Run a goal-conditioned checkpoint with no goal, against its learned "
+                           "null embedding. Needs --goal-dropout above 0 at training time. Compare "
+                           "with the same run's goal score to see what the goal is worth")
+
     replay = parser.add_argument_group("replay")
     replay.add_argument("--bundle", default=None, help="Bundle name under --data-root, or a path")
-    replay.add_argument("--data-root", type=Path, default=Path("outputs/policy_lab/data"))
+    replay.add_argument("--data-root", type=Path, default=Path("piper-data/dataset"))
     replay.add_argument("--episode", type=int, default=0, help="Episode index within the bundle")
     replay.add_argument("--max-steps", type=int, default=0, help="Stop early (0 = the whole episode)")
     replay.add_argument("--json", type=Path, default=None, help="Write the per-step trace here")
@@ -63,6 +79,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--latency-steps", type=int, default=20,
                         help="Predictions timed in latency mode")
     return parser.parse_args(argv)
+
+
+def read_goal_image(path: Path) -> np.ndarray:
+    """A goal frame off disk, in the raw BGR the runner's own crop expects."""
+    import cv2
+
+    frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise SystemExit(f"Could not read --goal-image {path}")
+    return frame
+
+
+def episode_goal(bundle: Bundle, episode_index: int) -> np.ndarray:
+    """The last frame of an episode, converted back to camera BGR.
+
+    Bundle frames are already RGB at the model's resolution; the runner expects
+    what a camera hands it, so the channels are swapped back here and its centre
+    crop is a no-op on an already square frame. This is the goal validation used
+    - ``GoalChunkDataset(random_goal=False)`` pins the same frame.
+    """
+    episode = bundle.episodes[episode_index]
+    frame_rgb = np.array(bundle.frames[episode.shard][episode.end - 1])
+    return frame_rgb[:, :, ::-1].copy()
 
 
 def resolve_bundle_dir(name: str, data_root: Path) -> Path:
@@ -165,7 +204,7 @@ def replay_episode(runner: PolicyRunner, bundle: Bundle, episode_index: int,
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     weights = args.guidance_weight
-    runner = PolicyRunner(
+    runner = load_runner(
         args.checkpoint,
         device=args.device,
         use_ema=args.use_ema,
@@ -173,6 +212,20 @@ def main(argv: list[str] | None = None) -> None:
         num_inference_steps=args.num_inference_steps,
         guidance_weight=weights[0] if weights else None,
     )
+    goal_conditioned = runner.config.goal_conditioned
+    if args.goal_image is not None and not goal_conditioned:
+        raise SystemExit(f"{runner.run_name} was not trained with --goal-conditioned.")
+    if args.no_goal and not goal_conditioned:
+        raise SystemExit(f"{runner.run_name} has no goal to leave out.")
+    if args.no_goal and runner.config.goal_dropout <= 0.0:
+        raise SystemExit(
+            f"{runner.run_name} was trained with --goal-dropout 0, so its null-goal embedding "
+            "is untrained and --no-goal would condition on noise. Retrain with "
+            "--goal-dropout 0.1 to make this comparison."
+        )
+    if args.goal_image is not None and args.no_goal:
+        raise SystemExit("--goal-image and --no-goal ask for opposite things.")
+
     description = runner.describe()
     print(f"checkpoint   {description['checkpoint']} (step {description['step']})")
     print(f"policy       simple/{description['objective']} · predict {description['chunk_size']} · "
@@ -185,6 +238,22 @@ def main(argv: list[str] | None = None) -> None:
           + ("" if runner.supports_guidance else " - guidance unavailable"))
     print(f"action       {description['action_repr']}"
           + (f"/{description['delta_mode']}" if description["action_repr"] == "delta" else ""))
+
+    if goal_conditioned:
+        if args.no_goal:
+            source = "none (learned null embedding)"
+        elif args.goal_image is not None:
+            runner.set_goal(read_goal_image(args.goal_image))
+            source = str(args.goal_image)
+        elif args.bundle is None:
+            # Latency mode feeds the model a blank observation, so a blank goal
+            # keeps the pair consistent. It costs the same either way.
+            runner.set_goal(np.zeros((480, 640, 3), dtype=np.uint8))
+            source = "blank (latency mode)"
+        else:
+            source = "the replayed episode's last frame"  # set once the bundle is open
+        print(f"goal         {source} | trained on the last "
+              f"{description['goal_window']} frames, dropout {description['goal_dropout']}")
 
     if args.bundle is None:
         timing = measure_latency(runner, args.latency_steps)
@@ -200,6 +269,11 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     bundle = Bundle(resolve_bundle_dir(args.bundle, args.data_root))
+    if not 0 <= args.episode < len(bundle.episodes):
+        raise SystemExit(f"--episode {args.episode} is outside [0, {len(bundle.episodes)})")
+    if goal_conditioned and args.goal_image is None and not args.no_goal:
+        runner.set_goal(episode_goal(bundle, args.episode))
+
     runner.warmup()
     episode = bundle.episodes[args.episode]
 

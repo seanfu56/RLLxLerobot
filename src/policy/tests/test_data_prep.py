@@ -13,8 +13,10 @@ from policy.data_prep import (
     BUNDLE_SPECS,
     JOINT_NAMES,
     build_shard,
+    discover_tasks,
     load_episode,
     preprocess_frame,
+    resolve_sources,
     write_bundle,
 )
 
@@ -186,32 +188,52 @@ class BuildShardTests(unittest.TestCase):
         self.assertEqual(len(manifest["stats"]["state"]["mean"]), len(JOINT_NAMES))
 
 
-class BundleSpecTests(unittest.TestCase):
-    def test_every_bundle_is_defined(self) -> None:
+class BundleResolutionTests(unittest.TestCase):
+    """Which raw directories a bundle name refers to.
+
+    Bundles used to be a hardcoded table, which went stale the moment a
+    recording session was named something new. They are discovered from disk
+    now, so these tests cover the discovery instead of the table.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.raw = Path(self.temporary.name)
+        for task in ("pick-can-m1", "pick-can-m2"):
+            (self.raw / task / "episode_000").mkdir(parents=True)
+        # Not a task: no episode_* inside, so it must not be offered as one.
+        (self.raw / "notes").mkdir()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_only_directories_holding_episodes_count_as_tasks(self) -> None:
+        self.assertEqual(discover_tasks(self.raw), ["pick-can-m1", "pick-can-m2"])
+
+    def test_a_task_directory_needs_no_entry_in_the_table(self) -> None:
+        # The whole point of dropping the table: a new session is usable the
+        # moment it is recorded.
+        tasks = discover_tasks(self.raw)
+        self.assertNotIn("pick-can-m1", BUNDLE_SPECS)
+        self.assertEqual(resolve_sources("pick-can-m1", self.raw, tasks), ("pick-can-m1",))
+
+    def test_the_table_still_defines_bundles_that_merge_sessions(self) -> None:
+        tasks = discover_tasks(self.raw)
         self.assertEqual(
-            sorted(BUNDLE_SPECS),
-            [
-                "pick-bar",
-                "pick-can",
-                "pick-can-2",
-                "pick-can-all",
-                "pick-scissors",
-                "pick-scissors-2",
-                "pick-scissors-all",
-            ],
+            resolve_sources("pick-can-all", self.raw, tasks), ("pick-can-m1", "pick-can-m2")
         )
 
-    def test_combined_bundles_name_their_parts(self) -> None:
-        self.assertEqual(BUNDLE_SPECS["pick-can-all"], ("pick-can", "pick-can-2"))
-        self.assertEqual(BUNDLE_SPECS["pick-scissors-all"], ("pick-scissors", "pick-scissors-2"))
+    def test_a_missing_source_fails_before_anything_is_decoded(self) -> None:
+        # Failing late - after decoding several gigabytes of the other shards -
+        # is the failure mode this check exists to prevent.
+        tasks = discover_tasks(self.raw)
+        with self.assertRaises(SystemExit) as error:
+            resolve_sources("pick-scissors", self.raw, tasks)
+        self.assertIn("pick-can-m1", str(error.exception))  # lists what is available
 
-    def test_every_source_a_bundle_names_is_reachable(self) -> None:
-        # A combined bundle must only reference sources that are themselves
-        # defined, or data_prep fails late, after decoding the other shards.
-        for bundle, sources in BUNDLE_SPECS.items():
-            for source in sources:
-                if source != bundle:
-                    self.assertIn(source, BUNDLE_SPECS, f"{bundle} references unknown {source}")
+    def test_an_empty_raw_root_is_reported_rather_than_silently_empty(self) -> None:
+        with self.assertRaises(SystemExit):
+            discover_tasks(self.raw / "does-not-exist")
 
 
 if __name__ == "__main__":

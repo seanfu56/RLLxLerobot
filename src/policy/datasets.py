@@ -106,9 +106,14 @@ class Bundle:
         return train, val
 
 
-def _augment(frame: np.ndarray, rng: np.random.Generator, crop_scale: float, color_jitter: float,
-             crop_box: tuple[int, int, int] | None = None) -> tuple[np.ndarray, tuple[int, int, int]]:
-    """Random square crop + photometric jitter. Returns the frame and its crop box."""
+def augment_frame(frame: np.ndarray, rng: np.random.Generator, crop_scale: float, color_jitter: float,
+                  crop_box: tuple[int, int, int] | None = None) -> tuple[np.ndarray, tuple[int, int, int]]:
+    """Random square crop + photometric jitter. Returns the frame and its crop box.
+
+    Passing a ``crop_box`` back in reuses that crop instead of drawing a new one,
+    which is how every frame of one sample - the observation stack and, under
+    ``policy.goal``, the goal frame - ends up sharing a single crop.
+    """
     size = frame.shape[0]
     if crop_box is None:
         side = int(round(size * float(rng.uniform(crop_scale, 1.0))))
@@ -209,7 +214,7 @@ class ChunkDataset(Dataset):
                 # One crop box for the whole stack. The camera is static, so a
                 # per-frame crop would inject apparent motion that is not real and
                 # teach the policy to read velocity out of the augmentation.
-                frame, crop_box = _augment(frame, rng, self.crop_scale, self.color_jitter, crop_box)
+                frame, crop_box = augment_frame(frame, rng, self.crop_scale, self.color_jitter, crop_box)
             images.append(torch.from_numpy(frame).permute(2, 0, 1).contiguous())
 
         chunk_offsets = np.minimum(offset + np.arange(self.horizon), last_offset)
@@ -220,7 +225,25 @@ class ChunkDataset(Dataset):
             "state": torch.from_numpy(states[episode.start + history].copy()),  # (T, D)
             "action": torch.from_numpy(actions[episode.start + chunk_offsets].copy()),
             "action_is_pad": torch.from_numpy(is_pad),
+            **self.extra_items(episode, offset, rng, crop_box),
         }
+
+    def extra_items(
+        self,
+        episode: EpisodeRef,
+        offset: int,
+        rng: np.random.Generator,
+        crop_box: tuple[int, int, int] | None,
+    ) -> dict[str, torch.Tensor]:
+        """Extra fields a subclass adds to the sample. Empty here.
+
+        ``crop_box`` is the crop the observation stack used, so an extra frame
+        from the same (static) camera can be cropped identically instead of
+        appearing shifted relative to what the policy is looking at. It is None
+        when augmentation is off. ``policy.goal.GoalChunkDataset`` uses this to
+        attach the goal frame.
+        """
+        return {}
 
 
 def default_drop_n_last_frames(horizon: int, n_action_steps: int, n_obs_steps: int) -> int:

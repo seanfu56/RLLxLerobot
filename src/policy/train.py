@@ -8,6 +8,9 @@
 (rectified flow, velocity prediction, Euler sampling). Nothing else changes -
 same encoder, same U-Net, same conditioning, same action representation.
 
+``--goal-conditioned`` adds a goal frame, drawn from the end of the episode, to
+what the policy conditions on; see ``src/policy/goal.py``.
+
 Writes one directory per run - run.json, log.jsonl, best.pt / final.pt /
 step_*.pt - which is what ``sweeps/collect_results.py`` and the Streamlit
 checkpoint picker read.
@@ -39,10 +42,12 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from policy.config import ACTION_REPRS, DELTA_MODES, FLOW_TIME_SAMPLINGS, OBJECTIVES, PolicyConfig
     from policy.datasets import Bundle, ChunkDataset, compute_stats, default_drop_n_last_frames
+    from policy.goal import DEFAULT_GOAL_WINDOW, GoalChunkDataset, GoalChunkPolicy
     from policy.model import ChunkPolicy
 else:
     from .config import ACTION_REPRS, DELTA_MODES, FLOW_TIME_SAMPLINGS, OBJECTIVES, PolicyConfig
     from .datasets import Bundle, ChunkDataset, compute_stats, default_drop_n_last_frames
+    from .goal import DEFAULT_GOAL_WINDOW, GoalChunkDataset, GoalChunkPolicy
     from .model import ChunkPolicy
 
 DEFAULT_ABSOLUTE_DIMS = ("gripper.pos",)
@@ -55,6 +60,10 @@ OBJECTIVE_ONLY_DEFAULTS = {
     "diffusion": {"num_train_timesteps": 100, "beta_schedule": "cosine"},
     "flow": {"flow_time_sampling": "uniform"},
 }
+
+# Same idea for the goal-conditioning flags, which do nothing at all without
+# --goal-conditioned.
+GOAL_ONLY_DEFAULTS = {"goal_window": DEFAULT_GOAL_WINDOW, "goal_dropout": 0.0}
 
 
 def resolve_absolute_dims(values: list[str] | None, joint_names: list[str]) -> list[int]:
@@ -125,7 +134,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     data = parser.add_argument_group("data")
     data.add_argument("--bundle", required=True, help="Bundle name under --data-root, or a path to a bundle dir")
-    data.add_argument("--data-root", type=Path, default=Path("outputs/policy_lab/data"))
+    data.add_argument("--data-root", type=Path, default=Path("piper-data/dataset"))
     data.add_argument("--output-root", type=Path, default=Path("models/simple"))
     data.add_argument("--run-name", default=None, help="Defaults to <bundle>_simple_h<horizon>")
     data.add_argument("--val-episodes", type=int, default=3, help="Held-out episodes per source (0 disables)")
@@ -187,6 +196,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     objective.add_argument("--action-norm", choices=("meanstd", "minmax", "identity"), default="minmax")
     objective.add_argument("--no-mask-padding", dest="mask_loss_for_padding", action="store_false",
                            help="Include copy-padded chunk steps in the loss")
+
+    goal = parser.add_argument_group("goal conditioning")
+    goal.add_argument("--goal-conditioned", action="store_true",
+                      help="Also condition on a goal frame drawn from the end of the episode "
+                           "(see src/policy/goal.py)")
+    goal.add_argument("--goal-window", type=int, default=GOAL_ONLY_DEFAULTS["goal_window"],
+                      help="The goal is drawn from the last N frames of the episode")
+    goal.add_argument("--goal-dropout", type=float, default=GOAL_ONLY_DEFAULTS["goal_dropout"],
+                      help="Rate at which the goal is replaced by a learned null embedding. "
+                           "Above 0 the checkpoint can also be run with no goal at all, which "
+                           "is how to measure what the goal is contributing")
 
     optimization = parser.add_argument_group("optimisation")
     optimization.add_argument("--steps", type=int, default=18000)
@@ -263,6 +283,9 @@ def build_config(args: argparse.Namespace, bundle: Bundle, stats: dict) -> Polic
         num_inference_steps=args.num_inference_steps,
         beta_schedule=args.beta_schedule,
         flow_time_sampling=args.flow_time_sampling,
+        goal_conditioned=args.goal_conditioned,
+        goal_window=args.goal_window,
+        goal_dropout=args.goal_dropout,
         use_proprio=args.use_proprio,
         cond_dropout=args.cond_dropout,
         guidance_weight=args.guidance_weight,
@@ -366,7 +389,7 @@ def evaluate(
 
 
 def warn_about_ignored_flags(args: argparse.Namespace) -> list[str]:
-    """Name the flags that belong to the objective this run is *not* using."""
+    """Name the flags this run's settings make inert."""
     ignored = []
     for objective, defaults in OBJECTIVE_ONLY_DEFAULTS.items():
         if objective == args.objective:
@@ -377,6 +400,12 @@ def warn_about_ignored_flags(args: argparse.Namespace) -> list[str]:
                 ignored.append(flag)
                 print(f"warning: {flag} is a {objective} setting and does nothing under "
                       f"--objective {args.objective}")
+    if not args.goal_conditioned:
+        for name, default in GOAL_ONLY_DEFAULTS.items():
+            if getattr(args, name) != default:
+                flag = "--" + name.replace("_", "-")
+                ignored.append(flag)
+                print(f"warning: {flag} does nothing without --goal-conditioned")
     return ignored
 
 
@@ -407,7 +436,11 @@ def main(argv: list[str] | None = None) -> None:
         drop_n_last_frames=drop_n_last,
         seed=args.seed,
     )
-    train_dataset = ChunkDataset(
+    dataset_class = GoalChunkDataset if args.goal_conditioned else ChunkDataset
+    if args.goal_conditioned:
+        dataset_kwargs["goal_window"] = args.goal_window
+
+    train_dataset = dataset_class(
         bundle, train_episodes, augment=args.augment, crop_scale=args.crop_scale,
         color_jitter=args.color_jitter, **dataset_kwargs
     )
@@ -417,7 +450,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     val_loader = None
     if val_episodes:
-        val_dataset = ChunkDataset(bundle, val_episodes, augment=False, **dataset_kwargs)
+        # Validation pins the goal to the final frame: a goal that moves between
+        # evaluations makes val_loss noisy, and val_loss is what selects best.pt.
+        if args.goal_conditioned:
+            dataset_kwargs["random_goal"] = False
+        val_dataset = dataset_class(bundle, val_episodes, augment=False, **dataset_kwargs)
         val_loader = DataLoader(
             val_dataset, batch_size=args.batch_size, shuffle=False,
             num_workers=min(2, args.num_workers), pin_memory=True,
@@ -425,7 +462,7 @@ def main(argv: list[str] | None = None) -> None:
 
     config = build_config(args, bundle, stats)
     device = args.device if torch.cuda.is_available() or not args.device.startswith("cuda") else "cpu"
-    model = ChunkPolicy(config).to(device)
+    model = (GoalChunkPolicy if config.goal_conditioned else ChunkPolicy)(config).to(device)
     counts = model.parameter_counts()
 
     optimizer = torch.optim.AdamW(
@@ -489,6 +526,9 @@ def main(argv: list[str] | None = None) -> None:
     print(f"unet         {tuple(args.down_dims)} kernel {args.kernel_size}")
     print(f"guidance     cond dropout {args.cond_dropout} | weight {args.guidance_weight}"
           f"{' (plain conditional)' if args.guidance_weight == 1.0 else ''}")
+    if args.goal_conditioned:
+        print(f"goal         one of the last {args.goal_window} frames | dropout {args.goal_dropout}"
+              f"{' (needs a goal at inference)' if args.goal_dropout == 0.0 else ''}")
     print(f"augment      crop >= {args.crop_scale if args.augment else 1.0}, "
           f"jitter {args.color_jitter if args.augment else 0.0}")
     print(f"parameters   {counts['total']/1e6:.1f}M total "
@@ -499,7 +539,7 @@ def main(argv: list[str] | None = None) -> None:
         payload = {
             "step": step,
             # Descriptive only; the config below is what actually rebuilds the model.
-            "kind": f"simple-{config.objective}",
+            "kind": f"simple-{config.objective}" + ("-goal" if config.goal_conditioned else ""),
             "config": config.to_dict(),
             "model": {key: value.cpu() for key, value in model.state_dict().items()},
             "ema": ema.state_dict() if ema else None,

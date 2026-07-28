@@ -235,6 +235,8 @@ def checkpoint_panel() -> PolicySettings | None:
                 "action_repr": config.get("action_repr"),
                 "cond_dropout": config.get("cond_dropout"),
                 "guidance_weight": config.get("guidance_weight"),
+                "goal_conditioned": config.get("goal_conditioned"),
+                "goal_window": config.get("goal_window"),
                 "checkpoint": str(checkpoint.path),
             }
         )
@@ -291,6 +293,30 @@ def checkpoint_panel() -> PolicySettings | None:
         if cond_dropout > 0.0
         else "Guidance unavailable: trained with --cond-dropout 0."
     )
+    # Goal conditioning. The goal is fixed for the whole rollout, so it is a load
+    # -time setting rather than something to retune live like the guidance weight.
+    goal_image: Path | None = None
+    if bool(config.get("goal_conditioned")):
+        goal_dropout = float(config.get("goal_dropout") or 0.0)
+        typed = st.text_input(
+            "Goal image",
+            value="",
+            disabled=driving,
+            help=(
+                "A photo of the finished task, from this camera. Training drew the goal from "
+                f"the last {config.get('goal_window', 10)} frames of each episode, so a frame "
+                "grabbed from a successful rollout is exactly the right thing to point at."
+            ),
+        ).strip()
+        goal_image = Path(typed) if typed else None
+        if goal_image is None and goal_dropout <= 0.0:
+            st.warning(
+                "This checkpoint was trained with --goal-dropout 0, so it has no null-goal "
+                "branch and will refuse to step without a goal image."
+            )
+        elif goal_image is None:
+            st.caption("🎯 No goal: runs against the learned null embedding.")
+
     device = st.selectbox("Device", ("cuda", "cpu"), index=0, disabled=driving)
     use_ema = st.checkbox(
         "Use EMA weights",
@@ -306,6 +332,7 @@ def checkpoint_panel() -> PolicySettings | None:
             num_inference_steps=num_inference_steps,
             device=device,
             use_ema=use_ema,
+            goal_image=goal_image,
         )
     except ValueError as exc:
         st.error(str(exc))

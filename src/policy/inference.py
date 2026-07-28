@@ -36,6 +36,11 @@ else:
 
 
 class PolicyRunner:
+    # The module the checkpoint's weights are loaded into. Subclasses that
+    # extend the architecture override this; ``policy.goal.load_runner`` picks
+    # the right subclass from the config so callers never have to.
+    policy_class = ChunkPolicy
+
     def __init__(
         self,
         checkpoint_path: str | Path,
@@ -54,8 +59,18 @@ class PolicyRunner:
         self.step: int | None = payload.get("step")
         self.use_ema = bool(use_ema and payload.get("ema"))
 
+        # A goal-conditioned checkpoint has a wider conditioning vector and an
+        # extra encoder input, so loading it here would fail on a state-dict key
+        # mismatch. Say what it actually needs instead.
+        if self.config.goal_conditioned and self.policy_class is ChunkPolicy:
+            raise ValueError(
+                f"{self.checkpoint_path.parent.name} is goal-conditioned and needs a goal frame "
+                "at every step. Load it with policy.goal.load_runner() or GoalPolicyRunner, "
+                "which takes one."
+            )
+
         self.device = device if torch.cuda.is_available() or not device.startswith("cuda") else "cpu"
-        self.policy = ChunkPolicy(self.config)
+        self.policy = self.policy_class(self.config)
         # ``null_cond`` arrived with classifier-free guidance; checkpoints written
         # before it are otherwise complete and still perfectly usable at weight
         # 1.0, so tolerate exactly that key and keep every other mismatch loud.
@@ -157,14 +172,18 @@ class PolicyRunner:
         self.frames.clear()
         self.states.clear()
 
-    @torch.no_grad()
-    def _predict_from_history(self) -> np.ndarray:
+    def observation_batch(self) -> dict[str, torch.Tensor]:
+        """The recorded history as a batch of one. Subclasses add their inputs here."""
         if not self.frames:
             raise RuntimeError("No observation recorded yet; call select_action or predict_chunk first")
-        batch = {
+        return {
             "image": torch.stack(list(self.frames), dim=1),  # (1, T, 3, H, W)
             "state": torch.stack(list(self.states), dim=1),  # (1, T, D)
         }
+
+    @torch.no_grad()
+    def _predict_from_history(self) -> np.ndarray:
+        batch = self.observation_batch()
         return self.policy.predict(batch, guidance_weight=self.guidance_weight)[0].float().cpu().numpy()
 
     def predict_chunk(self, frame_bgr: np.ndarray, state: np.ndarray) -> np.ndarray:
@@ -240,4 +259,7 @@ class PolicyRunner:
             "down_dims": list(self.config.down_dims),
             "guidance_weight": self.guidance_weight,
             "cond_dropout": self.config.cond_dropout,
+            "goal_conditioned": self.config.goal_conditioned,
+            "goal_window": self.config.goal_window,
+            "goal_dropout": self.config.goal_dropout,
         }

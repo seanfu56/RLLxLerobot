@@ -106,11 +106,18 @@ class PolicySettings:
     # Classifier-free guidance. None keeps whatever the checkpoint was trained
     # with; 1.0 is plain conditional sampling.
     guidance_weight: float | None = None
+    # Goal frame for a --goal-conditioned checkpoint. Read in the hardware
+    # process, so this is a path rather than an array.
+    goal_image: Path | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checkpoint", Path(self.checkpoint).expanduser())
         if not self.checkpoint.is_file():
             raise ValueError(f"Checkpoint not found: {self.checkpoint}")
+        if self.goal_image is not None:
+            object.__setattr__(self, "goal_image", Path(self.goal_image).expanduser())
+            if not self.goal_image.is_file():
+                raise ValueError(f"Goal image not found: {self.goal_image}")
         if self.action_steps < 1:
             raise ValueError("action_steps must be at least 1.")
         if self.num_inference_steps is not None and self.num_inference_steps < 1:
@@ -152,6 +159,11 @@ class PolicyInfo:
     # True only when the checkpoint was trained with conditioning dropout, i.e.
     # when it actually has an unconditional branch to guide away from.
     supports_guidance: bool = False
+    # Goal conditioning (see src/policy/goal.py). ``has_goal`` is False when a
+    # goal-conditioned checkpoint is running against its learned null embedding,
+    # which only a --goal-dropout run can do.
+    goal_conditioned: bool = False
+    has_goal: bool = False
 
     def headline(self) -> str:
         # Both objectives sample iteratively: DDIM steps for diffusion, Euler
@@ -159,9 +171,12 @@ class PolicyInfo:
         sampler = f"{self.num_inference_steps} sampler steps"
         observing = f", observing {self.n_obs_steps}" if self.n_obs_steps > 1 else ""
         guided = f" · guidance {self.guidance_weight:g}" if self.guidance_weight != 1.0 else ""
+        goal = ""
+        if self.goal_conditioned:
+            goal = " · goal set" if self.has_goal else " · no goal (null embedding)"
         return (
             f"{self.run_name} · {self.policy}/{self.objective} ({sampler}) · "
-            f"chunk {self.chunk_size}, executing {self.action_steps}{observing}{guided}"
+            f"chunk {self.chunk_size}, executing {self.action_steps}{observing}{guided}{goal}"
         )
 
 
@@ -434,21 +449,41 @@ class _PolicyDriver:
         return self.runner.action_dict(action), elapsed
 
 
+def _read_goal_image(path: Path) -> Any:
+    """Load a goal frame as the raw BGR the runner's own crop expects."""
+    import cv2
+
+    frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError(f"Could not read goal image: {path}")
+    return frame
+
+
 def _build_runner(settings: PolicySettings) -> Any:
-    """Import torch and build the runner; only ever called in the child process."""
+    """Import torch and build the runner; only ever called in the child process.
+
+    ``load_runner`` picks the goal-conditioned runner for a goal-conditioned
+    checkpoint and the plain one otherwise, and refuses a goal frame that has
+    nowhere to go.
+    """
     try:
-        from policy.inference import PolicyRunner
+        from policy.goal import load_runner
     except ModuleNotFoundError:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-        from policy.inference import PolicyRunner
+        from policy.goal import load_runner
 
-    return PolicyRunner(
+    extra = {}
+    if settings.goal_image is not None:
+        extra["goal"] = _read_goal_image(settings.goal_image)
+
+    return load_runner(
         settings.checkpoint,
         device=settings.device,
         use_ema=settings.use_ema,
         action_steps=settings.action_steps,
         num_inference_steps=settings.num_inference_steps,
         guidance_weight=settings.guidance_weight,
+        **extra,
     )
 
 
@@ -481,6 +516,8 @@ def _default_policy_factory(settings: PolicySettings) -> _PolicyDriver:
         down_dims=tuple(description.get("down_dims") or ()),
         guidance_weight=float(description.get("guidance_weight", 1.0)),
         supports_guidance=float(description.get("cond_dropout") or 0.0) > 0.0,
+        goal_conditioned=bool(description.get("goal_conditioned", False)),
+        has_goal=bool(description.get("has_goal", False)),
     )
     return _PolicyDriver(runner, info)
 

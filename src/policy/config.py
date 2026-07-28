@@ -83,6 +83,16 @@ class PolicyConfig:
     # Flow matching only: the distribution training times are drawn from.
     flow_time_sampling: str = "uniform"
 
+    # --- goal conditioning (implemented in policy.goal) ---
+    # When set, the model also sees a goal frame drawn from the last
+    # ``goal_window`` frames of the episode, encoded by the same ResNet and
+    # appended to the conditioning vector. ``goal_dropout`` replaces that frame
+    # with a learned null embedding at training time, which is what makes a
+    # goal-conditioned checkpoint runnable with no goal at all.
+    goal_conditioned: bool = False
+    goal_window: int = 10
+    goal_dropout: float = 0.0
+
     # --- conditioning ---
     use_proprio: bool = True
     # Classifier-free guidance. Training replaces the whole conditioning vector
@@ -159,6 +169,13 @@ class PolicyConfig:
                 raise ValueError("Every dimension is absolute; use --action-repr absolute instead")
         elif self.absolute_dims:
             raise ValueError("absolute_dims only applies to --action-repr delta")
+
+        if self.goal_window < 1:
+            raise ValueError(f"goal_window must be >= 1, got {self.goal_window}")
+        if not 0.0 <= self.goal_dropout < 1.0:
+            raise ValueError(f"goal_dropout must be in [0, 1), got {self.goal_dropout}")
+        if self.goal_dropout > 0.0 and not self.goal_conditioned:
+            raise ValueError("goal_dropout only applies to --goal-conditioned runs")
 
         if not 0.0 <= self.cond_dropout < 1.0:
             raise ValueError(f"cond_dropout must be in [0, 1), got {self.cond_dropout}")

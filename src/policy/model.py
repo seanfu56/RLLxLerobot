@@ -244,8 +244,7 @@ class ChunkPolicy(nn.Module):
         self.register_buffer("delta_mask", delta_mask)
 
         self.rgb_encoder = RgbEncoder(config)
-        per_step = self.rgb_encoder.feature_dim + (config.state_dim if config.use_proprio else 0)
-        self.global_cond_dim = per_step * config.n_obs_steps
+        self.global_cond_dim = self._global_cond_dim()
         self.unet = ConditionalUnet1d(config, global_cond_dim=self.global_cond_dim)
 
         # Stands in for "no observation at all". Always allocated so a checkpoint
@@ -258,13 +257,24 @@ class ChunkPolicy(nn.Module):
     # conditioning
     # ------------------------------------------------------------------
 
-    def encode_context(self, batch: dict[str, Tensor]) -> Tensor:
-        """Flat conditioning vector [B, per_step * n_obs_steps].
+    def _global_cond_dim(self) -> int:
+        """Width of the conditioning vector, before it reaches the U-Net.
 
-        Under ``cond_dropout`` a fraction of the batch has its whole conditioning
-        replaced by the null embedding during training. Dropping both modalities
-        together is what makes the null branch a genuine "no observation" model
-        rather than a half-conditioned one.
+        Called once from ``__init__``, after the vision encoder exists and
+        before the U-Net is built. A subclass that conditions on more than the
+        observation history - ``policy.goal.GoalChunkPolicy`` - widens the vector
+        by overriding this.
+        """
+        per_step = self.rgb_encoder.feature_dim + (
+            self.config.state_dim if self.config.use_proprio else 0
+        )
+        return per_step * self.config.n_obs_steps
+
+    def observation_features(self, batch: dict[str, Tensor]) -> Tensor:
+        """The observation half of the conditioning, [B, per_step * n_obs_steps].
+
+        No dropout here: it is applied once to the finished vector, so that a
+        subclass appending its own conditioning is dropped along with this.
         """
         images = batch["image"]  # (B, T, 3, H, W)
         batch_size, steps = images.shape[:2]
@@ -273,12 +283,23 @@ class ChunkPolicy(nn.Module):
         if self.config.use_proprio:
             state = self.state_normalizer.normalize(batch["state"])  # (B, T, D)
             parts.append(state.to(features.dtype))
-        context = torch.cat(parts, dim=-1).flatten(1)
+        return torch.cat(parts, dim=-1).flatten(1)
 
+    def apply_cond_dropout(self, context: Tensor) -> Tensor:
+        """Replace a fraction of the batch's conditioning with the null embedding.
+
+        Training only. Dropping every modality together is what makes the null
+        branch a genuine "no observation" model rather than a half-conditioned
+        one, and it is what classifier-free guidance extrapolates away from.
+        """
         if self.training and self.config.cond_dropout > 0.0:
-            keep = (torch.rand(batch_size, 1, device=context.device) >= self.config.cond_dropout)
+            keep = (torch.rand(context.shape[0], 1, device=context.device) >= self.config.cond_dropout)
             context = torch.where(keep, context, self.null_cond.to(context.dtype))
         return context
+
+    def encode_context(self, batch: dict[str, Tensor]) -> Tensor:
+        """Flat conditioning vector [B, global_cond_dim]."""
+        return self.apply_cond_dropout(self.observation_features(batch))
 
     def unconditional_context(self, batch_size: int, dtype: torch.dtype) -> Tensor:
         return self.null_cond.to(dtype).expand(batch_size, -1)
