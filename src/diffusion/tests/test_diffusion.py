@@ -8,16 +8,22 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from diffusion.data import center_square_crop, resolve_video_paths
+from diffusion.data import (
+    VideoClipDataset,
+    VideoInfo,
+    center_square_crop,
+    four_frame_indices,
+    resolve_video_paths,
+)
 from diffusion.diffusion import GaussianDiffusion
 from diffusion.model import VideoUNet, VideoUNetConfig
 
 
-def small_model(*, conditional: bool = False) -> VideoUNet:
+def small_model(*, condition_channels: int = 0) -> VideoUNet:
     return VideoUNet(
         VideoUNetConfig(
             channels=3,
-            condition_channels=3 if conditional else 0,
+            condition_channels=condition_channels,
             base_channels=8,
             channel_multipliers=(1, 2),
             blocks_per_level=1,
@@ -32,6 +38,24 @@ class DiffusionTests(unittest.TestCase):
         cropped = center_square_crop(frame)
         self.assertEqual(cropped.shape, (480, 480, 3))
         np.testing.assert_array_equal(cropped, frame[:, 80:560])
+
+    def test_four_frame_indices_fix_first_and_evenly_space_middle(self) -> None:
+        self.assertEqual(four_frame_indices(frame_count=167, last_index=160), (0, 53, 107, 160))
+        self.assertEqual(four_frame_indices(frame_count=167, last_index=166), (0, 55, 111, 166))
+
+    def test_training_endpoint_is_always_one_of_last_ten_frames(self) -> None:
+        dataset = VideoClipDataset.__new__(VideoClipDataset)
+        dataset.videos = [VideoInfo(Path("unused.mp4"), 167, 640, 480, 20.0)]
+        dataset.tail_frames = 10
+        dataset.random_tail = True
+        dataset.seed = 7
+        dataset._draws = 0
+        for _ in range(50):
+            indices = dataset.sample_indices(0)
+            self.assertEqual(indices[0], 0)
+            self.assertGreaterEqual(indices[-1], 157)
+            self.assertLessEqual(indices[-1], 166)
+            self.assertEqual(indices, four_frame_indices(167, indices[-1]))
 
     def test_bundle_resolves_raw_episode_videos_after_move(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -64,10 +88,17 @@ class DiffusionTests(unittest.TestCase):
         output = model(video, torch.tensor([3]))
         self.assertEqual(output.shape, video.shape)
 
-    def test_superres_unet_resizes_condition_frame_by_frame(self) -> None:
-        model = small_model(conditional=True)
-        video = torch.randn(1, 3, 2, 8, 8)
-        condition = torch.randn(1, 3, 2, 4, 4)
+    def test_base_unet_repeats_fixed_first_frame_condition(self) -> None:
+        model = small_model(condition_channels=3)
+        video = torch.randn(1, 3, 3, 8, 8)
+        condition = torch.randn(1, 3, 1, 4, 4)
+        output = model(video, torch.tensor([3]), condition)
+        self.assertEqual(output.shape, video.shape)
+
+    def test_superres_unet_accepts_six_channel_aligned_condition(self) -> None:
+        model = small_model(condition_channels=6)
+        video = torch.randn(1, 3, 3, 8, 8)
+        condition = torch.randn(1, 6, 3, 4, 4)
         output = model(video, torch.tensor([3]), condition)
         self.assertEqual(output.shape, video.shape)
 

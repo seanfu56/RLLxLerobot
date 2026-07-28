@@ -5,10 +5,11 @@ Examples:
     python src/diffusion/train.py --stage base
     python src/diffusion/train.py --stage superres
 
-The base stage learns unconditional 56x56 clips.  The super-resolution stage
-learns p(x_224 | x_56) from paired center-cropped frames.  It does not require
-the base checkpoint during training; the two checkpoints are chained by
-``sample.py`` after both stages have been trained.
+Each episode supplies four trajectory frames. The first is fixed conditioning;
+the base stage generates the other three at 56x56. The super-resolution stage
+learns their 56x56 to 224x224 mapping while also seeing the first 224x224 frame.
+It does not require the base checkpoint during training; the two checkpoints
+are chained by ``sample.py`` after both stages have been trained.
 """
 
 from __future__ import annotations
@@ -31,26 +32,32 @@ if __package__ in (None, ""):
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from diffusion.data import (
+        GENERATED_FRAMES,
         HIGH_RESOLUTION,
         LOW_RESOLUTION,
+        SAMPLED_FRAMES,
+        TAIL_FRAMES,
         VideoClipDataset,
         resolve_video_paths,
         split_video_paths,
         video_worker_init,
     )
     from diffusion.diffusion import GaussianDiffusion
-    from diffusion.model import VideoUNet, VideoUNetConfig
+    from diffusion.model import VideoUNet, VideoUNetConfig, spatial_resize
 else:
     from .data import (
+        GENERATED_FRAMES,
         HIGH_RESOLUTION,
         LOW_RESOLUTION,
+        SAMPLED_FRAMES,
+        TAIL_FRAMES,
         VideoClipDataset,
         resolve_video_paths,
         split_video_paths,
         video_worker_init,
     )
     from .diffusion import GaussianDiffusion
-    from .model import VideoUNet, VideoUNetConfig
+    from .model import VideoUNet, VideoUNetConfig, spatial_resize
 
 
 class ExponentialMovingAverage:
@@ -112,9 +119,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path("piper-data/dataset/pick-can-all"),
         help="Policy bundle, raw-video directory, or one video",
     )
-    data.add_argument("--clip-length", type=int, default=16)
-    data.add_argument("--frame-stride", type=int, default=1)
-    data.add_argument("--clip-step", type=int, default=4)
     data.add_argument(
         "--val-videos", type=int, default=6, help="Whole episodes held out for validation"
     )
@@ -221,7 +225,7 @@ def model_config_from_args(args: argparse.Namespace) -> VideoUNetConfig:
     is_superres = args.stage == "superres"
     return VideoUNetConfig(
         channels=3,
-        condition_channels=3 if is_superres else 0,
+        condition_channels=6 if is_superres else 3,
         base_channels=(
             args.base_channels
             if args.base_channels is not None
@@ -251,10 +255,25 @@ def stage_tensors(
     batch: dict[str, torch.Tensor], stage: str, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     low = batch[f"video_{LOW_RESOLUTION}"].to(device, non_blocking=True)
+    if low.shape[2] != SAMPLED_FRAMES:
+        raise ValueError(
+            f"Expected {SAMPLED_FRAMES} sampled frames, got tensor shape {tuple(low.shape)}"
+        )
+    first_low = low[:, :, :1]
+    future_low = low[:, :, 1:]
     if stage == "base":
-        return low, None
+        return future_low, first_low
     high = batch[f"video_{HIGH_RESOLUTION}"].to(device, non_blocking=True)
-    return high, low
+    first_high = high[:, :, :1]
+    future_high = high[:, :, 1:]
+    low_at_high_resolution = spatial_resize(
+        future_low, (HIGH_RESOLUTION, HIGH_RESOLUTION)
+    )
+    fixed_first_frame = first_high.expand(
+        -1, -1, GENERATED_FRAMES, -1, -1
+    )
+    condition = torch.cat((low_at_high_resolution, fixed_first_frame), dim=1)
+    return future_high, condition
 
 
 def autocast_context(device: torch.device, amp: str):
@@ -360,8 +379,9 @@ def save_checkpoint(
         "data_config": {
             "low_resolution": LOW_RESOLUTION,
             "high_resolution": HIGH_RESOLUTION,
-            "clip_length": args.clip_length,
-            "frame_stride": args.frame_stride,
+            "sampled_frames": SAMPLED_FRAMES,
+            "generated_frames": GENERATED_FRAMES,
+            "tail_frames": TAIL_FRAMES,
             "fps": args.source_fps,
         },
         "train_config": jsonable_args(args),
@@ -453,15 +473,23 @@ def main(argv: list[str] | None = None) -> None:
         if args.stage == "base"
         else (LOW_RESOLUTION, HIGH_RESOLUTION)
     )
-    dataset_kwargs = dict(
-        clip_length=args.clip_length,
-        frame_stride=args.frame_stride,
-        clip_step=args.clip_step,
+    train_dataset = VideoClipDataset(
+        train_paths,
         resolutions=resolutions,
+        tail_frames=TAIL_FRAMES,
+        random_tail=True,
+        seed=args.seed,
     )
-    train_dataset = VideoClipDataset(train_paths, **dataset_kwargs)
     val_dataset = (
-        VideoClipDataset(val_paths, **dataset_kwargs) if val_paths else None
+        VideoClipDataset(
+            val_paths,
+            resolutions=resolutions,
+            tail_frames=TAIL_FRAMES,
+            random_tail=False,
+            seed=args.seed,
+        )
+        if val_paths
+        else None
     )
     args.source_fps = train_dataset.fps
     batch_size = (
@@ -515,7 +543,14 @@ def main(argv: list[str] | None = None) -> None:
                 "stage": args.stage,
                 "model_config": model.config.to_dict(),
                 "diffusion_config": diffusion.config_dict(),
-                "data_config": {**dataset_kwargs, "fps": args.source_fps},
+                "data_config": {
+                    "low_resolution": LOW_RESOLUTION,
+                    "high_resolution": HIGH_RESOLUTION,
+                    "sampled_frames": SAMPLED_FRAMES,
+                    "generated_frames": GENERATED_FRAMES,
+                    "tail_frames": TAIL_FRAMES,
+                    "fps": args.source_fps,
+                },
                 "train_config": jsonable_args(args),
                 "train_videos": [str(path) for path in train_paths],
                 "val_videos": [str(path) for path in val_paths],
@@ -545,11 +580,12 @@ def main(argv: list[str] | None = None) -> None:
     print(
         f"{args.stage}: {parameters / 1e6:.1f}M parameters | "
         f"{len(train_paths)} train/{len(val_paths)} val videos | "
-        f"{len(train_dataset)} train clips | device={device}",
+        f"{len(train_dataset)} trajectory samples/epoch | device={device}",
         flush=True,
     )
     print(
-        f"target={LOW_RESOLUTION if args.stage == 'base' else HIGH_RESOLUTION}px | "
+        f"condition=frame 1 | generated=frames 2-{SAMPLED_FRAMES} at "
+        f"{LOW_RESOLUTION if args.stage == 'base' else HIGH_RESOLUTION}px | "
         f"batch={batch_size} x accumulation={grad_accumulation} | run={run_dir}",
         flush=True,
     )

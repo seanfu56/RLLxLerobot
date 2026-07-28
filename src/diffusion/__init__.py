@@ -1,13 +1,24 @@
 """Two-stage video diffusion for the Piper demonstration recordings."""
 
-from .data import HIGH_RESOLUTION, LOW_RESOLUTION, VideoClipDataset, resolve_video_paths
+from .data import (
+    GENERATED_FRAMES,
+    HIGH_RESOLUTION,
+    LOW_RESOLUTION,
+    SAMPLED_FRAMES,
+    TAIL_FRAMES,
+    VideoClipDataset,
+    resolve_video_paths,
+)
 from .diffusion import GaussianDiffusion
 from .model import VideoUNet, VideoUNetConfig
 
 __all__ = [
     "GaussianDiffusion",
+    "GENERATED_FRAMES",
     "HIGH_RESOLUTION",
     "LOW_RESOLUTION",
+    "SAMPLED_FRAMES",
+    "TAIL_FRAMES",
     "VideoClipDataset",
     "VideoUNet",
     "VideoUNetConfig",

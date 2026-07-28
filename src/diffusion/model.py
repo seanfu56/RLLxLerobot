@@ -135,7 +135,7 @@ class VideoUNetConfig:
 
 
 class VideoUNet(nn.Module):
-    """Predict noise for an unconditional or low-resolution-conditioned video."""
+    """Predict video noise, optionally conditioned on fixed or aligned frames."""
 
     def __init__(self, config: VideoUNetConfig):
         super().__init__()
@@ -233,12 +233,16 @@ class VideoUNet(nn.Module):
                 raise ValueError("This U-Net requires a low-resolution conditioning video")
             if condition.ndim != 5:
                 raise ValueError(f"Expected BxCxTxHxW condition, got {tuple(condition.shape)}")
-            if (
-                condition.shape[0] != noisy_video.shape[0]
-                or condition.shape[2] != noisy_video.shape[2]
-            ):
+            if condition.shape[0] != noisy_video.shape[0]:
                 raise ValueError(
-                    "Condition batch and temporal dimensions must match the noisy video: "
+                    "Condition batch dimension must match the noisy video: "
+                    f"{tuple(condition.shape)} vs {tuple(noisy_video.shape)}"
+                )
+            if condition.shape[2] == 1 and noisy_video.shape[2] != 1:
+                condition = condition.expand(-1, -1, noisy_video.shape[2], -1, -1)
+            elif condition.shape[2] != noisy_video.shape[2]:
+                raise ValueError(
+                    "Condition must contain one fixed frame or one frame per generated frame: "
                     f"{tuple(condition.shape)} vs {tuple(noisy_video.shape)}"
                 )
             if condition.shape[1] != self.config.condition_channels:
