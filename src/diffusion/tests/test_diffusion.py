@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 
@@ -19,6 +20,7 @@ from diffusion.diffusion import GaussianDiffusion
 from diffusion.image_model import ImageUNet, ImageUNetConfig
 from diffusion.model import VideoUNet, VideoUNetConfig
 from diffusion.train import stage_tensors
+from diffusion.video_io import write_mp4
 
 
 def small_model(*, condition_channels: int = 0) -> VideoUNet:
@@ -97,6 +99,17 @@ class DiffusionTests(unittest.TestCase):
         output = model(video, torch.tensor([3]), condition)
         self.assertEqual(output.shape, video.shape)
 
+    def test_base_training_uses_first_frame_only_as_condition(self) -> None:
+        values = torch.arange(4, dtype=torch.float32)[None, None, :, None, None]
+        batch = {"video_56": values.expand(1, 3, 4, 2, 2).clone()}
+        target, condition = stage_tensors(batch, "base", torch.device("cpu"))
+        self.assertEqual(condition.shape, (1, 3, 1, 2, 2))
+        self.assertEqual(target.shape, (1, 3, 3, 2, 2))
+        torch.testing.assert_close(condition[:, :, 0], torch.zeros(1, 3, 2, 2))
+        torch.testing.assert_close(
+            target[:, 0, :, 0, 0], torch.tensor([[1.0, 2.0, 3.0]])
+        )
+
     def test_superres_unet_is_strictly_2d(self) -> None:
         model = ImageUNet(
             ImageUNetConfig(
@@ -140,6 +153,53 @@ class DiffusionTests(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(sampled).all()))
         self.assertGreaterEqual(float(sampled.min()), -1)
         self.assertLessEqual(float(sampled.max()), 1)
+
+    def test_ddim_sampler_recovers_clean_data_from_oracle_noise(self) -> None:
+        diffusion = GaussianDiffusion(timesteps=20)
+
+        class OracleNoise(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+            def forward(
+                self,
+                noisy: torch.Tensor,
+                timesteps: torch.Tensor,
+                clean: torch.Tensor,
+            ) -> torch.Tensor:
+                alpha = diffusion.alpha_bars.gather(0, timesteps).reshape(
+                    timesteps.shape[0], *((1,) * (noisy.ndim - 1))
+                )
+                return (noisy - alpha.sqrt() * clean) / (1 - alpha).sqrt()
+
+        clean = torch.rand(1, 3, 3, 8, 8).mul(1.6).sub(0.8)
+        sampled = diffusion.sample(
+            OracleNoise(),
+            tuple(clean.shape),
+            condition=clean,
+            inference_steps=5,
+            generator=torch.Generator().manual_seed(4),
+        )
+        torch.testing.assert_close(sampled, clean, atol=2e-5, rtol=2e-5)
+
+    def test_mp4_keeps_first_frame_and_rgb_channel_order(self) -> None:
+        video = torch.zeros(3, 4, 16, 16)
+        video[:, 0] = torch.tensor([1.0, -1.0, -1.0])[:, None, None]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "color.mp4"
+            write_mp4(path, video, fps=4.0)
+            capture = cv2.VideoCapture(str(path))
+            ok, first_bgr = capture.read()
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            capture.release()
+        self.assertTrue(ok)
+        self.assertEqual(frame_count, 4)
+        first_rgb = cv2.cvtColor(first_bgr, cv2.COLOR_BGR2RGB)
+        means = first_rgb.mean(axis=(0, 1))
+        self.assertGreater(means[0], 200)
+        self.assertLess(means[1], 30)
+        self.assertLess(means[2], 30)
 
 
 if __name__ == "__main__":

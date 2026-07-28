@@ -78,6 +78,12 @@ super-resolution U-Net uses only 2D convolutions. It is deliberately smaller
 and enables gradient checkpointing because 224×224 image activations are
 expensive.
 
+The base now defaults to 32 initial channels (about 13M parameters) rather than
+64 (about 50M), and uses 500 warmup steps. This is a better fit for 60 episodes
+and means the step-1,000 preview has spent half its updates at or near the full
+learning rate. Step 1,000 is still an early-training diagnostic, not a
+converged sample; use the later previews before judging generation quality.
+
 Resume an interrupted run by preserving the original architecture flags:
 
 ```bash
@@ -107,6 +113,8 @@ Every evaluation also generates held-out MP4 previews with the EMA weights:
 
 ```text
 models/video_diffusion/pick-can-all/base/eval/step_0001000/sample_00_56.mp4
+models/video_diffusion/pick-can-all/base/eval/step_0001000/reference_00_56.mp4
+models/video_diffusion/pick-can-all/base/eval/step_0001000/condition_00_56.png
 models/video_diffusion/pick-can-all/superres/eval/step_0001000/sample_00_224.mp4
 ```
 
@@ -117,11 +125,18 @@ the unchanged first frame. `samples.json` beside each preview records the four
 source indices. The deterministic validation loss is retained for selecting
 `best.pt`; evaluation is therefore both visual and quantitative.
 
+Each MP4 is decoded immediately after writing. Training stops with an error if
+it does not contain four frames, has the wrong resolution, omits the condition,
+or swaps RGB/BGR channels. The condition is also saved separately as PNG, and
+the real held-out four-frame sequence is saved as `reference_*.mp4`. Playback
+defaults to 1 FPS because these are four sparse trajectory states, making the
+fixed first frame visible for a full second.
+
 Control preview generation with:
 
 ```bash
 python src/diffusion/train.py --stage base \
-  --eval-freq 1000 --eval-samples 2 --eval-inference-steps 25
+  --eval-freq 1000 --eval-samples 2 --eval-inference-steps 50
 ```
 
 ## Generate 224×224 MP4s

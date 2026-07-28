@@ -45,7 +45,7 @@ if __package__ in (None, ""):
     from diffusion.diffusion import GaussianDiffusion
     from diffusion.image_model import ImageUNet, ImageUNetConfig
     from diffusion.model import VideoUNet, VideoUNetConfig
-    from diffusion.video_io import write_mp4
+    from diffusion.video_io import write_mp4, write_png
 else:
     from .data import (
         GENERATED_FRAMES,
@@ -61,7 +61,7 @@ else:
     from .diffusion import GaussianDiffusion
     from .image_model import ImageUNet, ImageUNetConfig
     from .model import VideoUNet, VideoUNetConfig
-    from .video_io import write_mp4
+    from .video_io import write_mp4, write_png
 
 
 class ExponentialMovingAverage:
@@ -133,7 +133,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--base-channels",
         type=int,
         default=None,
-        help="Default: 64 for base and 32 for super-resolution",
+        help="Default: 32 for both stages",
     )
     architecture.add_argument(
         "--channel-multipliers",
@@ -181,7 +181,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     optimization.add_argument("--lr", type=float, default=2e-4)
     optimization.add_argument("--min-lr", type=float, default=2e-6)
-    optimization.add_argument("--warmup-steps", type=int, default=1000)
+    optimization.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=500,
+        help="The first 1,000-step preview is then past warmup rather than at its endpoint",
+    )
     optimization.add_argument("--weight-decay", type=float, default=1e-4)
     optimization.add_argument("--grad-clip", type=float, default=1.0)
     optimization.add_argument("--ema-decay", type=float, default=0.9999)
@@ -209,10 +214,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     output.add_argument(
         "--eval-inference-steps",
         type=int,
-        default=25,
+        default=50,
         help="DDIM steps used for evaluation video generation",
     )
-    output.add_argument("--eval-video-fps", type=float, default=4.0)
+    output.add_argument(
+        "--eval-video-fps",
+        type=float,
+        default=1.0,
+        help="The four sparse trajectory frames are shown for one second each by default",
+    )
     output.add_argument("--save-freq", type=int, default=5000)
     return parser.parse_args(argv)
 
@@ -248,7 +258,7 @@ def model_config_from_args(
         base_channels=(
             args.base_channels
             if args.base_channels is not None
-            else (32 if is_superres else 64)
+            else 32
         ),
         channel_multipliers=tuple(args.channel_multipliers or (1, 2, 4, 4)),
         blocks_per_level=args.blocks_per_level,
@@ -391,15 +401,16 @@ def evaluate(
     samples: int,
     inference_steps: int,
     seed: int,
-) -> tuple[float, list[torch.Tensor], list[list[int]]]:
+) -> tuple[float, list[torch.Tensor], list[torch.Tensor], list[list[int]]]:
     if not len(loader):
-        return float("nan"), [], []
+        return float("nan"), [], [], []
     backup = ema.swap_in(model)
     was_training = model.training
     model.eval()
     losses: list[float] = []
     preview_batches: list[dict[str, torch.Tensor]] = []
     preview_videos: list[torch.Tensor] = []
+    reference_videos: list[torch.Tensor] = []
     preview_indices: list[list[int]] = []
     try:
         for index, batch in enumerate(loader):
@@ -452,18 +463,25 @@ def evaluate(
                     seed=seed + preview_index,
                 )
             )
+            reference_key = (
+                f"video_{LOW_RESOLUTION}"
+                if stage == "base"
+                else f"video_{HIGH_RESOLUTION}"
+            )
+            reference_videos.append(preview_batch[reference_key][0].float().cpu())
             preview_indices.append(preview_batch["frame_indices"][0].tolist())
     finally:
         model.train(was_training)
         ema.swap_out(model, backup)
     loss = float(np.mean(losses)) if losses else float("nan")
-    return loss, preview_videos, preview_indices
+    return loss, preview_videos, reference_videos, preview_indices
 
 
 def save_evaluation_videos(
     run_dir: Path,
     step: int,
     videos: list[torch.Tensor],
+    references: list[torch.Tensor],
     frame_indices: list[list[int]],
     *,
     stage: str,
@@ -472,10 +490,27 @@ def save_evaluation_videos(
     output_dir = run_dir / "eval" / f"step_{step:07d}"
     resolution = LOW_RESOLUTION if stage == "base" else HIGH_RESOLUTION
     paths: list[str] = []
-    for index, video in enumerate(videos):
+    reference_paths: list[str] = []
+    condition_paths: list[str] = []
+    if not (len(videos) == len(references) == len(frame_indices)):
+        raise ValueError("Evaluation videos, references, and frame indices must have equal lengths")
+    for index, (video, reference) in enumerate(zip(videos, references, strict=True)):
+        if video.shape != reference.shape:
+            raise ValueError(
+                f"Generated/reference shape mismatch: {tuple(video.shape)} vs "
+                f"{tuple(reference.shape)}"
+            )
+        if not torch.equal(video[:, 0], reference[:, 0]):
+            raise RuntimeError("Generated evaluation video does not start with its condition frame")
         path = output_dir / f"sample_{index:02d}_{resolution}.mp4"
+        reference_path = output_dir / f"reference_{index:02d}_{resolution}.mp4"
+        condition_path = output_dir / f"condition_{index:02d}_{resolution}.png"
         write_mp4(path, video, fps)
+        write_mp4(reference_path, reference, fps)
+        write_png(condition_path, reference[:, 0])
         paths.append(str(path))
+        reference_paths.append(str(reference_path))
+        condition_paths.append(str(condition_path))
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "samples.json").write_text(
         json.dumps(
@@ -484,6 +519,8 @@ def save_evaluation_videos(
                 "stage": stage,
                 "frame_indices": frame_indices,
                 "videos": paths,
+                "references": reference_paths,
+                "conditions": condition_paths,
             },
             indent=2,
         ),
@@ -833,7 +870,7 @@ def main(argv: list[str] | None = None) -> None:
             and (completed_step % args.eval_freq == 0 or completed_step == args.steps)
         )
         if should_evaluate:
-            validation_loss, preview_videos, preview_indices = evaluate(
+            validation_loss, preview_videos, reference_videos, preview_indices = evaluate(
                 model,
                 ema,
                 diffusion,
@@ -851,6 +888,7 @@ def main(argv: list[str] | None = None) -> None:
                 run_dir,
                 completed_step,
                 preview_videos,
+                reference_videos,
                 preview_indices,
                 stage=args.stage,
                 fps=args.eval_video_fps,
