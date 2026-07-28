@@ -1,0 +1,2 @@
+streamlit>=1.59,<2
+opencv-python-headless>=4.9,<4.13

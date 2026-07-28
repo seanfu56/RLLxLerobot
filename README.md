@@ -5,7 +5,7 @@ Piper 機械手臂 + LeRobot framework 的 imitation learning 專案。
 包含資料收集/訓練/評估腳本、相關工具，以及兩個 lab 專用 LeRobot plugin（ROBOTIS leader、keyboard teleoperator）。
 Piper follower、OMY leader、OMY→Piper retarget 三個 plugin 已獨立發佈，安裝時 clone 到 `plugins/` 底下（見 Quick Start）。
 
-## 目錄結構
+## list
 
 ```
 plugins/          LeRobot plugins：2 個 lab 專用（內附）+ 3 個發佈版（clone 進來，見 Quick Start）
@@ -18,39 +18,26 @@ waypoints/        Waypoint 軌跡檔（JSON）
 
 ## Quick Start
 
-### 硬體需求
+### Hardware Requirements
 
 - **Follower**: AgileX Piper 機械手臂（CAN bus 連接）
 - **Leader**: ROBOTIS OMY-L100 leader arm（USB Serial, Dynamixel Protocol 2.0）
 - **Camera**: USB camera（例如 Logitech C270 overhead + ARC wrist cam）
 - **USB-CAN adapter**: 連接 Piper 用
 
-### 1. 環境安裝
+### 1. Environment Setup
 
 ```bash
-# 建立 conda 環境
 conda create -n piper python=3.10
 conda activate piper
 
-# clone 本專案
-git clone https://github.com/charlie8612/RLLxLerobot.git
+git clone https://github.com/seanfu56/RLLxLerobot.git
 cd RLLxLerobot
 
-# 安裝 LeRobot (https://github.com/huggingface/lerobot)
-# 本專案測試版本: v0.4.4 (commit 63dca86d)
-git clone https://github.com/huggingface/lerobot.git lerobot
+git clone https://github.com/huggingface/lerobot.git
 cd lerobot && git checkout v0.4.4
 
-# (A) 完整 GPU 版 —— 要訓練 / 跑 policy 用這個（預設就是 CUDA torch，約 3GB，下載較久）
 pip install -e ".[dev]"
-
-# (B) 只跑 teleop、不需 GPU —— 先裝 CPU torch 再裝本體（省下約 3GB CUDA 下載；順序不可顛倒）
-#     lerobot 依賴 torch，預設 torch 自帶 CUDA；teleop 不做推論，CPU 版即可。
-# pip install "torch>=2.2.1,<2.11.0" "torchvision>=0.21.0,<0.26.0" --index-url https://download.pytorch.org/whl/cpu
-# pip install -e .
-#
-# 之後想從 CPU 改回 GPU：用預設源重裝即可（自動配合 driver 的 CUDA 版本）
-# pip install --force-reinstall "torch>=2.2.1,<2.11.0" "torchvision>=0.21.0,<0.26.0"
 
 cd ..
 
@@ -72,22 +59,27 @@ pip install -e plugins/lerobot-teleoperator-robotis # lab 專用：ROBOTIS leade
 pip install -e plugins/lerobot-teleoperator-keypad  # lab 專用：鍵盤 teleop
 ```
 
-### 2. 硬體設定
+### 2. Hardware Setup 
+
+For the sudoer
 
 ```bash
-# 安裝 camera udev rules（固定 device 名稱，拔插不變）
 sudo cp config/99-usb-camera.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 
 # 把使用者加入 video group（存取 camera 用）
 sudo usermod -aG video $USER
 # 加完後需重新登入
+```
 
-# 啟動 CAN bus（每次開機後都要跑一次）
+For the user
+
+```bash
+啟動 CAN bus（每次開機後都要跑一次）
 bash scripts/0_can_up.sh
 ```
 
-### 3. Teleoperate（遙操作）
+### 3. Teleoperate
 
 用 leader arm 控制 Piper：
 
