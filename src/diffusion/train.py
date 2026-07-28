@@ -6,8 +6,8 @@ Examples:
     python src/diffusion/train.py --stage superres
 
 Each episode supplies four trajectory frames. The first is fixed conditioning;
-the base stage generates the other three at 56x56. The super-resolution stage
-learns their 56x56 to 224x224 mapping while also seeing the first 224x224 frame.
+the 3D base stage generates the other three at 56x56. The super-resolution
+stage is a 2D image diffusion model trained on each future frame independently.
 It does not require the base checkpoint during training; the two checkpoints
 are chained by ``sample.py`` after both stages have been trained.
 """
@@ -43,7 +43,9 @@ if __package__ in (None, ""):
         video_worker_init,
     )
     from diffusion.diffusion import GaussianDiffusion
-    from diffusion.model import VideoUNet, VideoUNetConfig, spatial_resize
+    from diffusion.image_model import ImageUNet, ImageUNetConfig
+    from diffusion.model import VideoUNet, VideoUNetConfig
+    from diffusion.video_io import write_mp4
 else:
     from .data import (
         GENERATED_FRAMES,
@@ -57,7 +59,9 @@ else:
         video_worker_init,
     )
     from .diffusion import GaussianDiffusion
-    from .model import VideoUNet, VideoUNetConfig, spatial_resize
+    from .image_model import ImageUNet, ImageUNetConfig
+    from .model import VideoUNet, VideoUNetConfig
+    from .video_io import write_mp4
 
 
 class ExponentialMovingAverage:
@@ -196,6 +200,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     output.add_argument("--log-freq", type=int, default=50)
     output.add_argument("--eval-freq", type=int, default=1000)
     output.add_argument("--eval-batches", type=int, default=8)
+    output.add_argument(
+        "--eval-samples",
+        type=int,
+        default=1,
+        help="Held-out videos generated and saved at every evaluation",
+    )
+    output.add_argument(
+        "--eval-inference-steps",
+        type=int,
+        default=25,
+        help="DDIM steps used for evaluation video generation",
+    )
+    output.add_argument("--eval-video-fps", type=float, default=4.0)
     output.add_argument("--save-freq", type=int, default=5000)
     return parser.parse_args(argv)
 
@@ -221,11 +238,13 @@ def bundle_name(path: Path) -> str:
     return path.stem
 
 
-def model_config_from_args(args: argparse.Namespace) -> VideoUNetConfig:
+def model_config_from_args(
+    args: argparse.Namespace,
+) -> VideoUNetConfig | ImageUNetConfig:
     is_superres = args.stage == "superres"
-    return VideoUNetConfig(
+    common = dict(
         channels=3,
-        condition_channels=6 if is_superres else 3,
+        condition_channels=3,
         base_channels=(
             args.base_channels
             if args.base_channels is not None
@@ -241,6 +260,20 @@ def model_config_from_args(args: argparse.Namespace) -> VideoUNetConfig:
             else args.gradient_checkpointing
         ),
     )
+    return ImageUNetConfig(**common) if is_superres else VideoUNetConfig(**common)
+
+
+def build_model(args: argparse.Namespace) -> VideoUNet | ImageUNet:
+    config = model_config_from_args(args)
+    return ImageUNet(config) if isinstance(config, ImageUNetConfig) else VideoUNet(config)
+
+
+def model_type(model: nn.Module) -> str:
+    if isinstance(model, VideoUNet):
+        return "video_unet_3d"
+    if isinstance(model, ImageUNet):
+        return "image_unet_2d"
+    raise TypeError(f"Unsupported diffusion model: {type(model).__name__}")
 
 
 def lr_at(step: int, args: argparse.Namespace) -> float:
@@ -264,16 +297,23 @@ def stage_tensors(
     if stage == "base":
         return future_low, first_low
     high = batch[f"video_{HIGH_RESOLUTION}"].to(device, non_blocking=True)
-    first_high = high[:, :, :1]
     future_high = high[:, :, 1:]
-    low_at_high_resolution = spatial_resize(
-        future_low, (HIGH_RESOLUTION, HIGH_RESOLUTION)
+
+    # The super-resolution model is image-based: BxCxTxHxW becomes
+    # (B*T)xCxHxW, with no temporal convolution or cross-frame input.
+    batch_size, channels, frames, high_height, high_width = future_high.shape
+    target_images = (
+        future_high.permute(0, 2, 1, 3, 4)
+        .reshape(batch_size * frames, channels, high_height, high_width)
+        .contiguous()
     )
-    fixed_first_frame = first_high.expand(
-        -1, -1, GENERATED_FRAMES, -1, -1
+    _, _, _, low_height, low_width = future_low.shape
+    condition_images = (
+        future_low.permute(0, 2, 1, 3, 4)
+        .reshape(batch_size * frames, channels, low_height, low_width)
+        .contiguous()
     )
-    condition = torch.cat((low_at_high_resolution, fixed_first_frame), dim=1)
-    return future_high, condition
+    return target_images, condition_images
 
 
 def autocast_context(device: torch.device, amp: str):
@@ -284,8 +324,61 @@ def autocast_context(device: torch.device, amp: str):
 
 
 @torch.no_grad()
+def generate_evaluation_video(
+    model: nn.Module,
+    diffusion: GaussianDiffusion,
+    batch: dict[str, torch.Tensor],
+    *,
+    stage: str,
+    device: torch.device,
+    amp: str,
+    inference_steps: int,
+    seed: int,
+) -> torch.Tensor:
+    """Generate one four-frame held-out video with the current EMA model."""
+    generator = torch.Generator(device=device).manual_seed(seed)
+    low = batch[f"video_{LOW_RESOLUTION}"].to(device, non_blocking=True)
+    if stage == "base":
+        first = low[:, :, :1]
+        with autocast_context(device, amp):
+            future = diffusion.sample(
+                model,
+                (1, 3, GENERATED_FRAMES, LOW_RESOLUTION, LOW_RESOLUTION),
+                condition=first,
+                inference_steps=inference_steps,
+                generator=generator,
+            )
+        return torch.cat((first, future), dim=2)[0].float().cpu()
+
+    high = batch[f"video_{HIGH_RESOLUTION}"].to(device, non_blocking=True)
+    first = high[:, :, :1]
+    future_low = (
+        low[:, :, 1:]
+        .permute(0, 2, 1, 3, 4)
+        .reshape(GENERATED_FRAMES, 3, LOW_RESOLUTION, LOW_RESOLUTION)
+        .contiguous()
+    )
+    with autocast_context(device, amp):
+        future_images = diffusion.sample(
+            model,
+            (GENERATED_FRAMES, 3, HIGH_RESOLUTION, HIGH_RESOLUTION),
+            condition=future_low,
+            inference_steps=inference_steps,
+            generator=generator,
+        )
+    future = (
+        future_images.reshape(
+            1, GENERATED_FRAMES, 3, HIGH_RESOLUTION, HIGH_RESOLUTION
+        )
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+    )
+    return torch.cat((first, future), dim=2)[0].float().cpu()
+
+
+@torch.no_grad()
 def evaluate(
-    model: VideoUNet,
+    model: nn.Module,
     ema: ExponentialMovingAverage,
     diffusion: GaussianDiffusion,
     loader: DataLoader,
@@ -295,17 +388,32 @@ def evaluate(
     amp: str,
     batches: int,
     snr_gamma: float | None,
-) -> float:
+    samples: int,
+    inference_steps: int,
+    seed: int,
+) -> tuple[float, list[torch.Tensor], list[list[int]]]:
     if not len(loader):
-        return float("nan")
+        return float("nan"), [], []
     backup = ema.swap_in(model)
     was_training = model.training
     model.eval()
     losses: list[float] = []
+    preview_batches: list[dict[str, torch.Tensor]] = []
+    preview_videos: list[torch.Tensor] = []
+    preview_indices: list[list[int]] = []
     try:
         for index, batch in enumerate(loader):
             if index >= batches:
                 break
+            if len(preview_batches) < samples:
+                remaining = samples - len(preview_batches)
+                for sample_index in range(min(remaining, batch["frame_indices"].shape[0])):
+                    preview_batches.append(
+                        {
+                            key: value[sample_index : sample_index + 1]
+                            for key, value in batch.items()
+                        }
+                    )
             target, condition = stage_tensors(batch, stage, device)
             generator = torch.Generator(device=device).manual_seed(91_337 + index)
             timesteps = torch.randint(
@@ -331,10 +439,57 @@ def evaluate(
                     noise=noise,
                 )
             losses.append(float(loss))
+        for preview_index, preview_batch in enumerate(preview_batches):
+            preview_videos.append(
+                generate_evaluation_video(
+                    model,
+                    diffusion,
+                    preview_batch,
+                    stage=stage,
+                    device=device,
+                    amp=amp,
+                    inference_steps=inference_steps,
+                    seed=seed + preview_index,
+                )
+            )
+            preview_indices.append(preview_batch["frame_indices"][0].tolist())
     finally:
         model.train(was_training)
         ema.swap_out(model, backup)
-    return float(np.mean(losses)) if losses else float("nan")
+    loss = float(np.mean(losses)) if losses else float("nan")
+    return loss, preview_videos, preview_indices
+
+
+def save_evaluation_videos(
+    run_dir: Path,
+    step: int,
+    videos: list[torch.Tensor],
+    frame_indices: list[list[int]],
+    *,
+    stage: str,
+    fps: float,
+) -> list[str]:
+    output_dir = run_dir / "eval" / f"step_{step:07d}"
+    resolution = LOW_RESOLUTION if stage == "base" else HIGH_RESOLUTION
+    paths: list[str] = []
+    for index, video in enumerate(videos):
+        path = output_dir / f"sample_{index:02d}_{resolution}.mp4"
+        write_mp4(path, video, fps)
+        paths.append(str(path))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "samples.json").write_text(
+        json.dumps(
+            {
+                "step": step,
+                "stage": stage,
+                "frame_indices": frame_indices,
+                "videos": paths,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return paths
 
 
 def jsonable_args(args: argparse.Namespace) -> dict:
@@ -363,7 +518,7 @@ def save_checkpoint(
     *,
     step: int,
     stage: str,
-    model: VideoUNet,
+    model: nn.Module,
     ema: ExponentialMovingAverage,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
@@ -373,6 +528,7 @@ def save_checkpoint(
     payload = {
         "format_version": 1,
         "stage": stage,
+        "model_type": model_type(model),
         "step": step,
         "model_config": model.config.to_dict(),
         "diffusion_config": diffusion.config_dict(),
@@ -399,7 +555,7 @@ def save_checkpoint(
 def load_resume(
     path: Path,
     *,
-    model: VideoUNet,
+    model: nn.Module,
     ema: ExponentialMovingAverage,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
@@ -411,6 +567,11 @@ def load_resume(
     if checkpoint_data.get("stage") != stage:
         raise ValueError(
             f"Cannot resume {stage!r} from a {checkpoint_data.get('stage')!r} checkpoint"
+        )
+    if checkpoint_data.get("model_type") != model_type(model):
+        raise ValueError(
+            f"Resume checkpoint model type {checkpoint_data.get('model_type')!r} "
+            f"does not match {model_type(model)!r}"
         )
     if checkpoint_data.get("model_config") != model.config.to_dict():
         raise ValueError("Resume checkpoint model configuration differs from the CLI configuration")
@@ -449,8 +610,14 @@ def make_loader(
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    if args.steps < 1 or args.eval_batches < 1:
-        raise SystemExit("--steps and --eval-batches must be positive")
+    if args.steps < 1 or args.eval_batches < 1 or args.eval_samples < 1:
+        raise SystemExit("--steps, --eval-batches, and --eval-samples must be positive")
+    if not 1 <= args.eval_inference_steps <= args.diffusion_steps:
+        raise SystemExit(
+            "--eval-inference-steps must be between 1 and --diffusion-steps"
+        )
+    if args.eval_video_fps <= 0:
+        raise SystemExit("--eval-video-fps must be positive")
     if args.log_freq < 1 or args.eval_freq < 1 or args.save_freq < 1:
         raise SystemExit("--log-freq, --eval-freq, and --save-freq must be positive")
     if args.num_workers < 0:
@@ -519,7 +686,7 @@ def main(argv: list[str] | None = None) -> None:
         else None
     )
 
-    model = VideoUNet(model_config_from_args(args)).to(device)
+    model = build_model(args).to(device)
     diffusion = GaussianDiffusion(args.diffusion_steps, args.beta_schedule).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -541,6 +708,7 @@ def main(argv: list[str] | None = None) -> None:
         json.dumps(
             {
                 "stage": args.stage,
+                "model_type": model_type(model),
                 "model_config": model.config.to_dict(),
                 "diffusion_config": diffusion.config_dict(),
                 "data_config": {
@@ -583,10 +751,16 @@ def main(argv: list[str] | None = None) -> None:
         f"{len(train_dataset)} trajectory samples/epoch | device={device}",
         flush=True,
     )
+    conditioning = (
+        "fixed frame 1"
+        if args.stage == "base"
+        else f"matching {LOW_RESOLUTION}px image (frames flattened)"
+    )
     print(
-        f"condition=frame 1 | generated=frames 2-{SAMPLED_FRAMES} at "
+        f"condition={conditioning} | target="
         f"{LOW_RESOLUTION if args.stage == 'base' else HIGH_RESOLUTION}px | "
-        f"batch={batch_size} x accumulation={grad_accumulation} | run={run_dir}",
+        f"model={model_type(model)} | batch={batch_size} x "
+        f"accumulation={grad_accumulation} | run={run_dir}",
         flush=True,
     )
     source_shapes = sorted({(info.height, info.width) for info in train_dataset.videos})
@@ -659,7 +833,7 @@ def main(argv: list[str] | None = None) -> None:
             and (completed_step % args.eval_freq == 0 or completed_step == args.steps)
         )
         if should_evaluate:
-            validation_loss = evaluate(
+            validation_loss, preview_videos, preview_indices = evaluate(
                 model,
                 ema,
                 diffusion,
@@ -669,11 +843,34 @@ def main(argv: list[str] | None = None) -> None:
                 amp=args.amp,
                 batches=args.eval_batches,
                 snr_gamma=snr_gamma,
+                samples=args.eval_samples,
+                inference_steps=args.eval_inference_steps,
+                seed=args.seed + 50_000,
             )
-            print(f"eval {completed_step:7d} | val_loss {validation_loss:.5f}", flush=True)
+            preview_paths = save_evaluation_videos(
+                run_dir,
+                completed_step,
+                preview_videos,
+                preview_indices,
+                stage=args.stage,
+                fps=args.eval_video_fps,
+            )
+            print(
+                f"eval {completed_step:7d} | val_loss {validation_loss:.5f} | "
+                f"generated {len(preview_paths)} video(s) in "
+                f"{run_dir / 'eval' / f'step_{completed_step:07d}'}",
+                flush=True,
+            )
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(
-                    json.dumps({"step": completed_step, "val_loss": validation_loss}) + "\n"
+                    json.dumps(
+                        {
+                            "step": completed_step,
+                            "val_loss": validation_loss,
+                            "eval_videos": preview_paths,
+                        }
+                    )
+                    + "\n"
                 )
             if validation_loss < best_loss:
                 best_loss = validation_loss

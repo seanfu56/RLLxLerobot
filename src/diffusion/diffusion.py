@@ -87,7 +87,7 @@ class GaussianDiffusion(nn.Module):
     def sample(
         self,
         model: nn.Module,
-        shape: tuple[int, int, int, int, int],
+        shape: tuple[int, ...],
         *,
         condition: torch.Tensor | None = None,
         inference_steps: int = 50,

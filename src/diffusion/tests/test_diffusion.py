@@ -16,7 +16,9 @@ from diffusion.data import (
     resolve_video_paths,
 )
 from diffusion.diffusion import GaussianDiffusion
+from diffusion.image_model import ImageUNet, ImageUNetConfig
 from diffusion.model import VideoUNet, VideoUNetConfig
+from diffusion.train import stage_tensors
 
 
 def small_model(*, condition_channels: int = 0) -> VideoUNet:
@@ -95,12 +97,31 @@ class DiffusionTests(unittest.TestCase):
         output = model(video, torch.tensor([3]), condition)
         self.assertEqual(output.shape, video.shape)
 
-    def test_superres_unet_accepts_six_channel_aligned_condition(self) -> None:
-        model = small_model(condition_channels=6)
-        video = torch.randn(1, 3, 3, 8, 8)
-        condition = torch.randn(1, 6, 3, 4, 4)
-        output = model(video, torch.tensor([3]), condition)
-        self.assertEqual(output.shape, video.shape)
+    def test_superres_unet_is_strictly_2d(self) -> None:
+        model = ImageUNet(
+            ImageUNetConfig(
+                base_channels=8,
+                channel_multipliers=(1, 2),
+                blocks_per_level=1,
+                time_embedding_dim=32,
+                gradient_checkpointing=False,
+            )
+        )
+        image = torch.randn(3, 3, 8, 8)
+        condition = torch.randn(3, 3, 4, 4)
+        output = model(image, torch.tensor([3, 4, 5]), condition)
+        self.assertEqual(output.shape, image.shape)
+        self.assertTrue(any(isinstance(module, torch.nn.Conv2d) for module in model.modules()))
+        self.assertFalse(any(isinstance(module, torch.nn.Conv3d) for module in model.modules()))
+
+    def test_superres_training_flattens_three_frames_into_images(self) -> None:
+        batch = {
+            "video_56": torch.randn(2, 3, 4, 56, 56),
+            "video_224": torch.randn(2, 3, 4, 224, 224),
+        }
+        target, condition = stage_tensors(batch, "superres", torch.device("cpu"))
+        self.assertEqual(target.shape, (6, 3, 224, 224))
+        self.assertEqual(condition.shape, (6, 3, 56, 56))
 
     def test_diffusion_loss_and_ddim_sample_are_finite(self) -> None:
         model = small_model()

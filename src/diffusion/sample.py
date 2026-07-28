@@ -10,6 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from torch import nn
 
 if __package__ in (None, ""):
     import sys
@@ -25,7 +26,9 @@ if __package__ in (None, ""):
         preprocess_frame,
     )
     from diffusion.diffusion import GaussianDiffusion
-    from diffusion.model import VideoUNet, VideoUNetConfig, spatial_resize
+    from diffusion.image_model import ImageUNet, ImageUNetConfig
+    from diffusion.model import VideoUNet, VideoUNetConfig
+    from diffusion.video_io import write_mp4
 else:
     from .data import (
         GENERATED_FRAMES,
@@ -37,7 +40,9 @@ else:
         preprocess_frame,
     )
     from .diffusion import GaussianDiffusion
-    from .model import VideoUNet, VideoUNetConfig, spatial_resize
+    from .image_model import ImageUNet, ImageUNetConfig
+    from .model import VideoUNet, VideoUNetConfig
+    from .video_io import write_mp4
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -69,14 +74,26 @@ def load_stage(
     expected_stage: str,
     device: torch.device,
     use_ema: bool,
-) -> tuple[VideoUNet, GaussianDiffusion, dict]:
+) -> tuple[nn.Module, GaussianDiffusion, dict]:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if checkpoint.get("stage") != expected_stage:
         raise ValueError(
             f"{checkpoint_path} is stage {checkpoint.get('stage')!r}, "
             f"expected {expected_stage!r}"
         )
-    model = VideoUNet(VideoUNetConfig.from_dict(checkpoint["model_config"])).to(device)
+    expected_model_type = (
+        "video_unet_3d" if expected_stage == "base" else "image_unet_2d"
+    )
+    if checkpoint.get("model_type") != expected_model_type:
+        raise ValueError(
+            f"{checkpoint_path} uses model type {checkpoint.get('model_type')!r}; "
+            f"expected {expected_model_type!r}"
+        )
+    if expected_stage == "base":
+        model = VideoUNet(VideoUNetConfig.from_dict(checkpoint["model_config"]))
+    else:
+        model = ImageUNet(ImageUNetConfig.from_dict(checkpoint["model_config"]))
+    model = model.to(device)
     weights = checkpoint.get("ema") if use_ema else checkpoint.get("model")
     if weights is None:
         raise ValueError(f"{checkpoint_path} does not contain the requested model weights")
@@ -95,36 +112,6 @@ def output_paths(path: Path, count: int, suffix: str = "") -> list[Path]:
         path.with_name(f"{path.stem}_{index:03d}{suffix}{path.suffix}")
         for index in range(count)
     ]
-
-
-def write_mp4(path: Path, video: torch.Tensor, fps: float) -> None:
-    """Write one normalized ``C x T x H x W`` RGB video."""
-    if fps <= 0:
-        raise ValueError(f"fps must be positive, got {fps}")
-    frames = (
-        video.detach()
-        .float()
-        .clamp(-1, 1)
-        .add(1)
-        .mul(127.5)
-        .round()
-        .byte()
-        .permute(1, 2, 3, 0)
-        .cpu()
-        .numpy()
-    )
-    height, width = frames.shape[1:3]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(
-        str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
-    )
-    if not writer.isOpened():
-        raise RuntimeError(f"Could not open MP4 writer for {path}")
-    try:
-        for frame_rgb in frames:
-            writer.write(cv2.cvtColor(np.ascontiguousarray(frame_rgb), cv2.COLOR_RGB2BGR))
-    finally:
-        writer.release()
 
 
 def read_condition_frame(path: Path) -> np.ndarray:
@@ -202,10 +189,9 @@ def main(argv: list[str] | None = None) -> None:
                 )
     if base_model.config.condition_channels != 3:
         raise ValueError("Base checkpoint must condition on the fixed RGB first frame")
-    if superres_model.config.condition_channels != 6:
+    if superres_model.config.condition_channels != 3:
         raise ValueError(
-            "Super-resolution checkpoint must condition on low-resolution futures "
-            "plus the fixed RGB first frame"
+            "Image super-resolution checkpoint must condition on one low-resolution RGB image"
         )
 
     condition_frame = read_condition_frame(args.condition)
@@ -241,27 +227,40 @@ def main(argv: list[str] | None = None) -> None:
             generator=generator,
             callback=progress("base 56x56"),
         )
-        superres_condition = torch.cat(
-            (
-                spatial_resize(low, (HIGH_RESOLUTION, HIGH_RESOLUTION)),
-                first_high.expand(-1, -1, GENERATED_FRAMES, -1, -1),
-            ),
-            dim=1,
+        low_images = (
+            low.permute(0, 2, 1, 3, 4)
+            .reshape(
+                args.num_videos * GENERATED_FRAMES,
+                3,
+                LOW_RESOLUTION,
+                LOW_RESOLUTION,
+            )
+            .contiguous()
         )
-        high = superres_diffusion.sample(
+        high_images = superres_diffusion.sample(
             superres_model,
             (
-                args.num_videos,
+                args.num_videos * GENERATED_FRAMES,
                 3,
-                GENERATED_FRAMES,
                 HIGH_RESOLUTION,
                 HIGH_RESOLUTION,
             ),
-            condition=superres_condition,
+            condition=low_images,
             inference_steps=args.superres_inference_steps,
             eta=args.eta,
             generator=generator,
             callback=progress("superres 224x224"),
+        )
+        high = (
+            high_images.reshape(
+                args.num_videos,
+                GENERATED_FRAMES,
+                3,
+                HIGH_RESOLUTION,
+                HIGH_RESOLUTION,
+            )
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
         )
         full_low = torch.cat((first_low, low), dim=2)
         full_high = torch.cat((first_high, high), dim=2)

@@ -5,7 +5,7 @@ This directory trains a two-stage video generator on the demonstrations in
 
 1. a first-frame-conditioned video DDPM that generates three future frames at
    **56×56**;
-2. a conditional video DDPM that super-resolves those three generated frames
+2. a **2D image DDPM** that independently super-resolves each generated frame
    from **56×56 to 224×224**.
 
 There is intentionally no 480×480 generation stage. The final 224×224 output
@@ -39,8 +39,10 @@ indices are recalculated from that sampled endpoint. Validation is deterministic
 and uses the actual final frame.
 
 The base DDPM receives frame 1 as its condition and diffuses only frames 2–4.
-The super-resolution DDPM receives the three low-resolution future frames plus
-the fixed first frame at 224×224. The first frame is never generated or changed.
+For super-resolution, the three future frames are flattened into three
+independent image pairs. The 2D DDPM receives one 56×56 RGB image and predicts
+its corresponding 224×224 image; it contains no 3D convolution and cannot mix
+information across frames. The first frame is never generated or changed.
 
 ## Train
 
@@ -70,10 +72,11 @@ models/video_diffusion/pick-can-all/superres/{best,latest,final}.pt
 
 Defaults use one four-frame trajectory sample per episode per epoch, 1,000
 diffusion time steps, a cosine noise schedule, EMA weights, and Min-SNR
-weighting. The 3D U-Net downsamples only the spatial axes; temporal 3×3×3
-convolutions retain cross-frame coherence among the three generated frames. The
-super-resolution defaults are deliberately smaller and enable gradient
-checkpointing because 224×224 video activations are expensive.
+weighting. The base 3D U-Net downsamples only the spatial axes; temporal 3×3×3
+convolutions retain cross-frame coherence among its three generated frames. The
+super-resolution U-Net uses only 2D convolutions. It is deliberately smaller
+and enables gradient checkpointing because 224×224 image activations are
+expensive.
 
 Resume an interrupted run by preserving the original architecture flags:
 
@@ -100,6 +103,27 @@ python src/diffusion/train.py --stage superres \
 Validation holds out complete episode videos, so an episode never appears in
 both training and validation.
 
+Every evaluation also generates held-out MP4 previews with the EMA weights:
+
+```text
+models/video_diffusion/pick-can-all/base/eval/step_0001000/sample_00_56.mp4
+models/video_diffusion/pick-can-all/superres/eval/step_0001000/sample_00_224.mp4
+```
+
+Base evaluation conditions on the held-out episode's fixed first frame and
+samples its three future frames. Super-resolution evaluation independently
+samples the three 224×224 images from the held-out 56×56 images, then prepends
+the unchanged first frame. `samples.json` beside each preview records the four
+source indices. The deterministic validation loss is retained for selecting
+`best.pt`; evaluation is therefore both visual and quantitative.
+
+Control preview generation with:
+
+```bash
+python src/diffusion/train.py --stage base \
+  --eval-freq 1000 --eval-samples 2 --eval-inference-steps 25
+```
+
 ## Generate 224×224 MP4s
 
 After both stages finish:
@@ -115,8 +139,10 @@ python src/diffusion/sample.py \
 
 `--condition` accepts an image, a video, or an episode directory containing
 `video.mp4`; for a video it reads frame zero. Sampling uses 50 DDIM steps per
-stage and EMA weights. The output always has exactly four frames: the unchanged
-condition followed by three generated 224×224 frames.
+stage and EMA weights. Each of the three 56×56 generated frames is passed
+through the 2D super-resolution sampler as a separate image. The output always
+has exactly four frames: the unchanged condition followed by three generated
+224×224 frames.
 
 Dependencies are PyTorch, NumPy, and OpenCV, all already present in the
 project's `piper` environment.
