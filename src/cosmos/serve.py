@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Serve a fine-tuned Cosmos3-Nano over HTTP, for use from the robot process.
+
+    python src/cosmos/serve.py --adapter models/cosmos3_nano_lora/pick-can-all/adapter
+
+The point of the split is that the model and the arm cannot share an
+environment: Cosmos3 needs diffusers from git and transformers 5, which
+`lerobot` declares itself incompatible with (see README.md).  Running the model
+behind a socket lets the robot process stay in `piper` and keeps the 35 GB of
+weights resident across episodes instead of reloading them per rollout.
+
+The wire format is JSON with base64 PNG payloads, so the client
+(``src/cosmos/client.py``) needs nothing but the standard library, numpy and
+OpenCV.  Images cross the wire as **BGR** PNGs -- the camera's own layout --
+so neither side has to remember a channel swap.
+
+Endpoints:
+
+    GET  /health    liveness plus the runner's configuration
+    POST /generate  {"image": "<b64 png>", ...} -> frames / goal / mp4
+
+Bind to 127.0.0.1 (the default) unless the robot is on another host; there is
+no authentication, so `--host 0.0.0.0` exposes the model to your whole network.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import logging
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+# Always import the sibling modules through this checkout's ``src`` directory.
+# Testing ``__package__`` alone is not sufficient: launchers such as runpy,
+# IDEs, and process supervisors can set it while omitting ``src`` from
+# ``sys.path``. Putting the resolved path first also prevents an unrelated
+# installed package named ``cosmos`` from winning the import.
+SRC_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SRC_ROOT))
+
+import cosmos as _cosmos_package
+
+_cosmos_package_file = getattr(_cosmos_package, "__file__", None)
+COSMOS_PACKAGE_DIR = (
+    Path(_cosmos_package_file).resolve().parent if _cosmos_package_file else None
+)
+if COSMOS_PACKAGE_DIR != Path(__file__).resolve().parent:
+    raise ImportError(
+        f"Imported 'cosmos' from {COSMOS_PACKAGE_DIR}; expected {Path(__file__).resolve().parent}"
+    )
+
+from cosmos.data import NUM_FRAMES, RESOLUTION
+from cosmos.runtime import (
+    DEFAULT_ADAPTER,
+    DEFAULT_FLOW_SHIFT,
+    DEFAULT_FPS,
+    DEFAULT_GUIDANCE,
+    DEFAULT_MODEL,
+    DEFAULT_STEPS,
+    CosmosRunner,
+)
+
+LOGGER = logging.getLogger("cosmos3-serve")
+
+DEFAULT_PORT = 8501
+OUTPUT_KINDS = ("goal", "frames", "video")
+# A conditioning PNG is ~200 KB; anything far above that is not a camera frame.
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
+
+
+def encode_png(frame_bgr: np.ndarray) -> str:
+    ok, buffer = cv2.imencode(".png", frame_bgr)
+    if not ok:
+        raise RuntimeError("cv2.imencode failed to encode a PNG")
+    return base64.b64encode(buffer.tobytes()).decode("ascii")
+
+
+def decode_png(payload: str) -> np.ndarray:
+    raw = np.frombuffer(base64.b64decode(payload), dtype=np.uint8)
+    frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("Could not decode the request image; expected a base64 PNG or JPEG")
+    return frame
+
+
+def pil_frames_to_bgr(frames) -> list[np.ndarray]:
+    return [cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2BGR) for frame in frames]
+
+
+class GenerationService:
+    """The runner plus the lock that keeps concurrent requests off one GPU."""
+
+    def __init__(self, runner: CosmosRunner):
+        self.runner = runner
+        self.lock = threading.Lock()
+        self.requests = 0
+
+    def generate(self, request: dict) -> dict:
+        if "image" not in request:
+            raise ValueError("Request is missing the required 'image' field")
+        kind = request.get("output", "goal")
+        if kind not in OUTPUT_KINDS:
+            raise ValueError(f"'output' must be one of {OUTPUT_KINDS}, got {kind!r}")
+
+        frame_bgr = decode_png(request["image"])
+        fps = float(request.get("fps", self.runner.fps))
+        started = time.perf_counter()
+        # One GPU, one generation at a time. ThreadingHTTPServer would happily
+        # run two forwards concurrently, which is slower and risks OOM.
+        with self.lock:
+            frames = self.runner.generate(
+                frame_bgr,
+                prompt=request.get("prompt"),
+                negative_prompt=request.get("negative_prompt"),
+                num_frames=request.get("num_frames"),
+                fps=fps,
+                steps=request.get("steps"),
+                guidance_scale=request.get("guidance_scale"),
+                seed=request.get("seed"),
+            )
+            self.requests += 1
+        elapsed = time.perf_counter() - started
+
+        response = {
+            "num_frames": len(frames),
+            "resolution": self.runner.resolution,
+            "fps": fps,
+            "seconds": round(elapsed, 3),
+            "output": kind,
+        }
+        if kind == "goal":
+            # Only the end state crosses the wire -- that is all a
+            # goal-conditioned policy consumes, and it is 1/93rd of the bytes.
+            response["goal"] = encode_png(pil_frames_to_bgr(frames[-1:])[0])
+        elif kind == "frames":
+            response["frames"] = [encode_png(frame) for frame in pil_frames_to_bgr(frames)]
+        else:
+            from diffusers.utils import export_to_video
+
+            with tempfile.NamedTemporaryFile(suffix=".mp4") as handle:
+                export_to_video(frames, handle.name, fps=round(fps))
+                response["video"] = base64.b64encode(Path(handle.name).read_bytes()).decode("ascii")
+        LOGGER.info("generate output=%s frames=%d in %.2fs", kind, len(frames), elapsed)
+        return response
+
+
+class CosmosRequestHandler(BaseHTTPRequestHandler):
+    service: GenerationService  # set on the handler class before serving
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *args) -> None:
+        LOGGER.debug("%s - %s", self.address_string(), fmt % args)
+
+    def _respond(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if self.path.rstrip("/") not in ("", "/health"):
+            self._respond(404, {"error": f"No such endpoint: {self.path}"})
+            return
+        payload = dict(self.service.runner.describe())
+        payload.update(
+            status="ok",
+            requests_served=self.service.requests,
+            server_file=str(Path(__file__).resolve()),
+            package_root=str(SRC_ROOT),
+            cosmos_package=str(COSMOS_PACKAGE_DIR),
+        )
+        self._respond(200, payload)
+
+    def do_POST(self) -> None:
+        if self.path.rstrip("/") != "/generate":
+            self._respond(404, {"error": f"No such endpoint: {self.path}"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._respond(400, {"error": "Malformed Content-Length"})
+            return
+        if length <= 0:
+            self._respond(400, {"error": "Empty request body"})
+            return
+        if length > MAX_REQUEST_BYTES:
+            self._respond(413, {"error": f"Request body exceeds {MAX_REQUEST_BYTES} bytes"})
+            return
+        try:
+            request = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            self._respond(400, {"error": f"Body is not valid JSON: {error}"})
+            return
+
+        try:
+            self._respond(200, self.service.generate(request))
+        except (ValueError, KeyError, FileNotFoundError) as error:
+            self._respond(400, {"error": str(error)})
+        except Exception as error:  # keep the server up when one request fails
+            LOGGER.exception("Generation failed")
+            self._respond(500, {"error": f"{type(error).__name__}: {error}"})
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="HTTP inference server for a fine-tuned Cosmos3-Nano.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    network = parser.add_argument_group("network")
+    network.add_argument("--host", default="127.0.0.1", help="0.0.0.0 exposes the model to the network")
+    network.add_argument("--port", type=int, default=DEFAULT_PORT)
+
+    model = parser.add_argument_group("model")
+    model.add_argument("--pretrained", default=DEFAULT_MODEL)
+    model.add_argument(
+        "--adapter",
+        default=DEFAULT_ADAPTER,
+        help="PEFT adapter directory; pass an empty string to serve the base model",
+    )
+    model.add_argument("--device", default="cuda")
+    model.add_argument("--resolution", type=int, default=RESOLUTION)
+    model.add_argument("--num-frames", type=int, default=NUM_FRAMES)
+    model.add_argument("--fps", type=float, default=DEFAULT_FPS)
+    model.add_argument("--steps", type=int, default=DEFAULT_STEPS)
+    model.add_argument("--guidance-scale", type=float, default=DEFAULT_GUIDANCE)
+    model.add_argument("--flow-shift", type=float, default=DEFAULT_FLOW_SHIFT)
+    model.add_argument("--prompt", default=None, help="Default caption when a request omits one")
+    model.add_argument("--no-warmup", action="store_true", help="Skip the throw-away first generation")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S", level=logging.INFO
+    )
+    LOGGER.info("Package root: %s (working directory: %s)", SRC_ROOT, Path.cwd())
+
+    runner = CosmosRunner(
+        pretrained=args.pretrained,
+        adapter=args.adapter or None,
+        device=args.device,
+        resolution=args.resolution,
+        num_frames=args.num_frames,
+        fps=args.fps,
+        steps=args.steps,
+        guidance_scale=args.guidance_scale,
+        flow_shift=args.flow_shift,
+        prompt=args.prompt,
+    )
+    if not args.no_warmup:
+        runner.warmup()
+
+    CosmosRequestHandler.service = GenerationService(runner)
+    server = ThreadingHTTPServer((args.host, args.port), CosmosRequestHandler)
+    LOGGER.info("Serving on http://%s:%d (Ctrl-C to stop)", args.host, args.port)
+    LOGGER.info("Config: %s", json.dumps(runner.describe()))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        LOGGER.info("Shutting down")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

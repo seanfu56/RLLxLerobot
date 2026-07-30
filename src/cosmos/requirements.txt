@@ -1,0 +1,47 @@
+# Cosmos3-Nano post-training and inference.
+#
+# Install into a SEPARATE environment, not `piper`: lerobot 0.4.4 pins
+# diffusers<0.36.0 and huggingface-hub<0.36.0, and Cosmos3 has to violate both.
+# See README.md for the conda create / pip install sequence.
+#
+# Versions are the ones this code was verified against on an RTX PRO 6000
+# (Blackwell, sm_120), Python 3.12.
+
+# --- torch -------------------------------------------------------------
+# Install first, from the CUDA index; sm_120 needs a cu128 or newer build:
+#   pip install torch==2.12.1 torchvision==0.27.1 \
+#       --index-url https://download.pytorch.org/whl/cu130
+torch==2.12.1
+torchvision==0.27.1
+
+# --- Cosmos3 model stack -----------------------------------------------
+# Cosmos3OmniPipeline / Cosmos3OmniTransformer are not in any tagged diffusers
+# release. Pin the commit rather than tracking main: the transformer's forward
+# return type changed from a 2-tuple to Cosmos3OmniTransformerOutput between
+# 0.39 and 0.40, and train.py reads `.sample`, so an unpinned main can break it.
+diffusers @ git+https://github.com/huggingface/diffusers.git@58a0c4d58d92b2e30ef08c506c267cbd4dfe9bca
+transformers==5.10.2
+tokenizers==0.22.2
+huggingface_hub==1.24.0
+safetensors==0.8.0
+accelerate==1.13.0
+peft==0.19.1
+
+# --- video / image io --------------------------------------------------
+opencv-python==5.0.0.93
+pillow==12.2.0
+imageio==2.37.3
+imageio-ffmpeg==0.6.0
+numpy==2.4.6
+
+# --- training logging --------------------------------------------------
+tensorboard==2.20.0
+tqdm==4.68.1
+# wandb  # optional; use with --report-to wandb
+
+# --- NOT required ------------------------------------------------------
+# cosmos_guardrail: only for the safety checker, which every script here
+# disables via enable_safety_checker=False. diffusers ships an import stub.
+#
+# The client (src/cosmos/client.py) needs NONE of this -- it is stdlib plus
+# numpy and cv2, so it imports directly into the `piper` environment.
