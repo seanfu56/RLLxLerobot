@@ -40,14 +40,24 @@ if __package__ in (None, ""):
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from policy.config import ACTION_REPRS, DELTA_MODES, FLOW_TIME_SAMPLINGS, OBJECTIVES, PolicyConfig
+    from policy.config import (
+        ACTION_REPRS, DELTA_MODES, FLOW_TIME_SAMPLINGS, GOAL_SELECTIONS, OBJECTIVES, PolicyConfig,
+    )
     from policy.datasets import Bundle, ChunkDataset, compute_stats, default_drop_n_last_frames
-    from policy.goal import DEFAULT_GOAL_WINDOW, GoalChunkDataset, GoalChunkPolicy
+    from policy.goal import (
+        DEFAULT_GOAL_FRAME_INDEX, DEFAULT_GOAL_FRAMES, DEFAULT_GOAL_WINDOW,
+        GoalChunkDataset, GoalChunkPolicy,
+    )
     from policy.model import ChunkPolicy
 else:
-    from .config import ACTION_REPRS, DELTA_MODES, FLOW_TIME_SAMPLINGS, OBJECTIVES, PolicyConfig
+    from .config import (
+        ACTION_REPRS, DELTA_MODES, FLOW_TIME_SAMPLINGS, GOAL_SELECTIONS, OBJECTIVES, PolicyConfig,
+    )
     from .datasets import Bundle, ChunkDataset, compute_stats, default_drop_n_last_frames
-    from .goal import DEFAULT_GOAL_WINDOW, GoalChunkDataset, GoalChunkPolicy
+    from .goal import (
+        DEFAULT_GOAL_FRAME_INDEX, DEFAULT_GOAL_FRAMES, DEFAULT_GOAL_WINDOW,
+        GoalChunkDataset, GoalChunkPolicy,
+    )
     from .model import ChunkPolicy
 
 DEFAULT_ABSOLUTE_DIMS = ("gripper.pos",)
@@ -63,7 +73,13 @@ OBJECTIVE_ONLY_DEFAULTS = {
 
 # Same idea for the goal-conditioning flags, which do nothing at all without
 # --goal-conditioned.
-GOAL_ONLY_DEFAULTS = {"goal_window": DEFAULT_GOAL_WINDOW, "goal_dropout": 0.0}
+GOAL_ONLY_DEFAULTS = {
+    "goal_selection": "uniform4",
+    "goal_frames": DEFAULT_GOAL_FRAMES,
+    "goal_frame_index": DEFAULT_GOAL_FRAME_INDEX,
+    "goal_window": DEFAULT_GOAL_WINDOW,
+    "goal_dropout": 0.0,
+}
 
 
 def resolve_absolute_dims(values: list[str] | None, joint_names: list[str]) -> list[int]:
@@ -199,10 +215,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     goal = parser.add_argument_group("goal conditioning")
     goal.add_argument("--goal-conditioned", action="store_true",
-                      help="Also condition on a goal frame drawn from the end of the episode "
+                      help="Also condition on a goal frame drawn from the episode "
                            "(see src/policy/goal.py)")
+    goal.add_argument("--goal-selection", choices=GOAL_SELECTIONS,
+                      default=GOAL_ONLY_DEFAULTS["goal_selection"],
+                      help="uniform4: sample --goal-frames evenly across the episode and take "
+                           "--goal-frame-index of them, the same rule src/diffusion generates "
+                           "video under. tail: a picture of the finished task")
+    goal.add_argument("--goal-frames", type=int, default=GOAL_ONLY_DEFAULTS["goal_frames"],
+                      help="Frames sampled across the episode under --goal-selection uniform4")
+    goal.add_argument("--goal-frame-index", type=int,
+                      default=GOAL_ONLY_DEFAULTS["goal_frame_index"],
+                      help="Which of those frames is the goal, counting from 0. The default 2 "
+                           "is the third of four, about two thirds of the way through")
     goal.add_argument("--goal-window", type=int, default=GOAL_ONLY_DEFAULTS["goal_window"],
-                      help="The goal is drawn from the last N frames of the episode")
+                      help="The episode's end is drawn from its last N frames")
     goal.add_argument("--goal-dropout", type=float, default=GOAL_ONLY_DEFAULTS["goal_dropout"],
                       help="Rate at which the goal is replaced by a learned null embedding. "
                            "Above 0 the checkpoint can also be run with no goal at all, which "
@@ -284,6 +311,9 @@ def build_config(args: argparse.Namespace, bundle: Bundle, stats: dict) -> Polic
         beta_schedule=args.beta_schedule,
         flow_time_sampling=args.flow_time_sampling,
         goal_conditioned=args.goal_conditioned,
+        goal_selection=args.goal_selection,
+        goal_frames=args.goal_frames,
+        goal_frame_index=args.goal_frame_index,
         goal_window=args.goal_window,
         goal_dropout=args.goal_dropout,
         use_proprio=args.use_proprio,
@@ -438,7 +468,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     dataset_class = GoalChunkDataset if args.goal_conditioned else ChunkDataset
     if args.goal_conditioned:
-        dataset_kwargs["goal_window"] = args.goal_window
+        dataset_kwargs.update(
+            goal_window=args.goal_window,
+            goal_selection=args.goal_selection,
+            goal_frames=args.goal_frames,
+            goal_frame_index=args.goal_frame_index,
+        )
 
     train_dataset = dataset_class(
         bundle, train_episodes, augment=args.augment, crop_scale=args.crop_scale,
@@ -527,7 +562,13 @@ def main(argv: list[str] | None = None) -> None:
     print(f"guidance     cond dropout {args.cond_dropout} | weight {args.guidance_weight}"
           f"{' (plain conditional)' if args.guidance_weight == 1.0 else ''}")
     if args.goal_conditioned:
-        print(f"goal         one of the last {args.goal_window} frames | dropout {args.goal_dropout}"
+        goal_rule = (
+            f"frame {args.goal_frame_index} of {args.goal_frames} sampled evenly"
+            if args.goal_selection == "uniform4"
+            else "the episode's last frame"
+        )
+        print(f"goal         {goal_rule}, ending in the last {args.goal_window} frames | "
+              f"dropout {args.goal_dropout}"
               f"{' (needs a goal at inference)' if args.goal_dropout == 0.0 else ''}")
     print(f"augment      crop >= {args.crop_scale if args.augment else 1.0}, "
           f"jitter {args.color_jitter if args.augment else 0.0}")

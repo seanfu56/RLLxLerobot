@@ -9,13 +9,32 @@ objective, the action representation or the sampler changes.
     python src/policy/train.py --bundle pick-can-m1 --run-name G_pick_can \
         --goal-conditioned --goal-dropout 0.1
 
-**Which frame is the goal.** One drawn uniformly from the last ``--goal-window``
-frames of the episode the sample came from - the last 10 by default. Not the
-final frame alone: the arm is still settling over the last half second, so the
-tail is a set of pictures that all mean "done", and training against a fresh
-draw each epoch stops the policy keying on one exact pixel arrangement. Nothing
-in the data has to be labelled for this; the goal is *hindsight*, read off the
-demonstration that was already recorded.
+**Which frame is the goal.** ``--goal-selection`` picks the rule, and the
+default is the one that matches what a video model actually hands you:
+
+``uniform4`` (default)
+    Sample four frames uniformly across the episode - ``[0, last/3, 2*last/3,
+    last]`` - and take the **third** of them, roughly two thirds of the way in.
+    ``last`` is drawn from the episode's final ``--goal-window`` frames, so the
+    three interior positions move a little from epoch to epoch. This is frame
+    for frame the rule ``src/diffusion/data.four_frame_indices`` trains the
+    video generator under, which is the whole point: at inference the video
+    model is conditioned on the rollout's first frame and generates exactly
+    those three future frames, so handing the policy generated frame 3 gives it
+    the same kind of picture training drew from a real episode. A goal that
+    training took from the end of the episode but inference takes from the
+    middle of a generated clip is a distribution shift nothing else corrects.
+``tail``
+    One frame drawn uniformly from the last ``--goal-window`` frames, i.e. a
+    picture of the finished task. Use it when the goal is a photograph of the
+    desired end state rather than something a video model produced.
+
+Neither rule needs anything in the data to be labelled; the goal is *hindsight*,
+read off the demonstration that was already recorded. Both redraw every time a
+sample is visited so the policy sees a spread of goals rather than keying on one
+exact pixel arrangement, and both pin the endpoint to the true final frame at
+validation, because a goal that moves between evaluations makes ``val_loss``
+noisy and ``val_loss`` is what selects ``best.pt``.
 
 **Why bother on a single-task bundle.** Mostly you should not expect much. Every
 episode of ``pick-can-m1`` ends in nearly the same picture, so the goal carries
@@ -59,26 +78,34 @@ if __package__ in (None, ""):
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from policy.config import PolicyConfig
+    from policy.config import GOAL_SELECTIONS, PolicyConfig
     from policy.datasets import ChunkDataset, EpisodeRef, augment_frame
     from policy.inference import PolicyRunner
     from policy.model import ChunkPolicy
 else:
-    from .config import PolicyConfig
+    from .config import GOAL_SELECTIONS, PolicyConfig
     from .datasets import ChunkDataset, EpisodeRef, augment_frame
     from .inference import PolicyRunner
     from .model import ChunkPolicy
 
 DEFAULT_GOAL_WINDOW = 10
+# Four frames sampled across the episode, of which the third is the goal. Both
+# numbers are the video generator's, not this file's: src/diffusion trains on
+# four frames per episode and generates the last three, and the third of them is
+# the one far enough ahead to be worth aiming at but still close enough that the
+# generator gets it right. See src/diffusion/data.four_frame_indices.
+DEFAULT_GOAL_FRAMES = 4
+DEFAULT_GOAL_FRAME_INDEX = 2
 
 __all__ = [
-    "DEFAULT_GOAL_WINDOW", "GoalChunkDataset", "GoalChunkPolicy", "GoalPolicyRunner",
-    "goal_offset_range", "is_goal_conditioned", "load_runner",
+    "DEFAULT_GOAL_FRAMES", "DEFAULT_GOAL_FRAME_INDEX", "DEFAULT_GOAL_WINDOW",
+    "GOAL_SELECTIONS", "GoalChunkDataset", "GoalChunkPolicy", "GoalPolicyRunner",
+    "goal_offset_range", "is_goal_conditioned", "load_runner", "uniform_frame_offsets",
 ]
 
 
 def goal_offset_range(episode_length: int, window: int) -> tuple[int, int]:
-    """Half-open range of episode offsets a goal may be drawn from.
+    """Half-open range of episode offsets the final frame may be drawn from.
 
     The last ``window`` frames, clamped for episodes shorter than the window -
     a 6-frame episode with ``window=10`` offers all six rather than an empty or
@@ -91,14 +118,34 @@ def goal_offset_range(episode_length: int, window: int) -> tuple[int, int]:
     return episode_length - min(window, episode_length), episode_length
 
 
-class GoalChunkDataset(ChunkDataset):
-    """``ChunkDataset`` plus a ``goal_image`` (3, H, W) drawn from the episode tail.
+def uniform_frame_offsets(last_offset: int, count: int = DEFAULT_GOAL_FRAMES) -> list[int]:
+    """``count`` offsets spread evenly over ``[0, last_offset]``, both included.
 
-    ``random_goal`` is the train/validation difference. Training redraws the goal
-    every time a sample is visited, so the policy sees the whole tail window;
-    validation pins it to the final frame, because a goal that moves between
-    evaluations makes ``val_loss`` noisy and ``val_loss`` is what selects
-    ``best.pt``.
+    The rounding is integer and deliberately the same expression
+    ``src/diffusion/data.four_frame_indices`` uses, so a policy trained here and
+    a video model trained there aim at the same frame of the same episode.
+    ``src/policy/tests/test_goal.py`` asserts the two agree; if this is changed,
+    that test is what catches the two drifting apart.
+    """
+    if last_offset < 0:
+        raise ValueError(f"last_offset must be >= 0, got {last_offset}")
+    if count < 2:
+        raise ValueError(f"count must be >= 2, got {count}")
+    divisor = count - 1
+    return [(index * last_offset + divisor // 2) // divisor for index in range(count)]
+
+
+class GoalChunkDataset(ChunkDataset):
+    """``ChunkDataset`` plus a ``goal_image`` (3, H, W) drawn from the episode.
+
+    ``goal_selection`` picks which frame - see the module docstring. Both rules
+    treat the episode's last ``goal_window`` frames as interchangeable endings
+    (the arm is still settling over the final half second) and draw from them,
+    which is where the randomness the caller asked for comes from.
+
+    ``random_goal`` is the train/validation difference: validation pins the
+    endpoint to the true final frame, so the goal is the same picture at every
+    evaluation and ``val_loss`` - which selects ``best.pt`` - is comparable.
 
     Under augmentation the goal is cropped with the observation stack's crop box
     rather than its own. The camera is static, so a crop is a global shift of the
@@ -110,20 +157,43 @@ class GoalChunkDataset(ChunkDataset):
         self,
         *args: Any,
         goal_window: int = DEFAULT_GOAL_WINDOW,
+        goal_selection: str = "uniform4",
+        goal_frames: int = DEFAULT_GOAL_FRAMES,
+        goal_frame_index: int = DEFAULT_GOAL_FRAME_INDEX,
         random_goal: bool = True,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         if goal_window < 1:
             raise ValueError(f"goal_window must be >= 1, got {goal_window}")
+        if goal_selection not in GOAL_SELECTIONS:
+            raise ValueError(
+                f"goal_selection must be one of {GOAL_SELECTIONS}, got {goal_selection!r}"
+            )
+        if goal_frames < 2:
+            raise ValueError(f"goal_frames must be >= 2, got {goal_frames}")
+        if not 0 <= goal_frame_index < goal_frames:
+            raise ValueError(
+                f"goal_frame_index must be in [0, {goal_frames}), got {goal_frame_index}"
+            )
         self.goal_window = int(goal_window)
+        self.goal_selection = goal_selection
+        self.goal_frames = int(goal_frames)
+        self.goal_frame_index = int(goal_frame_index)
         self.random_goal = bool(random_goal)
 
-    def goal_offset(self, episode: EpisodeRef, rng: np.random.Generator) -> int:
+    def last_offset(self, episode: EpisodeRef, rng: np.random.Generator) -> int:
+        """Which frame counts as "the end" of this episode for this draw."""
         start, end = goal_offset_range(len(episode), self.goal_window)
         if not self.random_goal:
             return end - 1
         return int(rng.integers(start, end))
+
+    def goal_offset(self, episode: EpisodeRef, rng: np.random.Generator) -> int:
+        last = self.last_offset(episode, rng)
+        if self.goal_selection == "tail":
+            return last
+        return uniform_frame_offsets(last, self.goal_frames)[self.goal_frame_index]
 
     def extra_items(
         self,

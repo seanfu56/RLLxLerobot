@@ -163,5 +163,30 @@ through the 2D super-resolution sampler as a separate image. The output always
 has exactly four frames: the unchanged condition followed by three generated
 224×224 frames.
 
+`--condition` also accepts a whole dataset — a policy bundle or any directory
+tree of videos — and then generates one video per episode from that episode's
+own first frame, loading both checkpoints once:
+
+```bash
+python src/diffusion/sample.py \
+  --base-checkpoint models/video_diffusion/pick-can-all/base/best.pt \
+  --superres-checkpoint models/video_diffusion/pick-can-all-sr/best.pt \
+  --condition piper-data/dataset/pick-can-all \
+  --output samples/pick-can-all \
+  --save-low-resolution --save-frames --save-reference
+```
+
+`--output` must then be a directory. Each file is named after its episode, as
+in `pick-can-m1_episode_000.mp4`, beside a `samples.json` manifest recording
+every condition path, seed, and output. `--save-frames` adds the four-frame
+PNG strip that training previews also write, and `--save-reference` adds the
+episode's real four frames for side-by-side comparison.
+
+Episodes are sampled `--batch-size` at a time. Each video draws both stages'
+starting noise from its own seed (`--seed` plus its position), so regrouping or
+subsetting the run does not change which noise a given episode gets; the
+finished pixels still move slightly with batch size, because cuDNN selects
+convolution algorithms per batch shape.
+
 Dependencies are PyTorch, NumPy, and OpenCV, all already present in the
 project's `piper` environment.

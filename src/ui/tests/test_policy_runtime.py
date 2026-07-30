@@ -20,6 +20,7 @@ from ui.policy_runtime import (
     _PolicyDriver,
     _PROCESS_OPERATIONS,
     _policy_meta,
+    count_outcomes,
 )
 from ui.teleop_runtime import (
     ACTION_KEYS,
@@ -87,6 +88,20 @@ class FakeRunner:
         self.reset_calls = 0
         self.states: list[list[float]] = []
         self.guidance_weight = 1.0
+        self.goal: Any = None
+
+    @property
+    def has_goal(self) -> bool:
+        return self.goal is not None
+
+    def set_goal(self, frame_bgr: Any) -> None:
+        # Mirrors GoalPolicyRunner: the queued chunk was planned for the old goal.
+        self.goal = frame_bgr
+        self.queue.clear()
+
+    def clear_goal(self) -> None:
+        self.goal = None
+        self.queue.clear()
 
     def set_guidance_weight(self, weight: float) -> None:
         # Mirrors PolicyRunner: the queued chunk came from the old weight.
@@ -127,6 +142,10 @@ class FakeCamera:
         self.preview_enabled = config.camera.preview_enabled
         self.published = 0
         self.recorded_frames: list[dict[str, float | int]] = []
+        self.frame: Any = None
+
+    def latest_frame(self) -> Any | None:
+        return self.frame
 
     def start(self) -> None:
         self.started = True
@@ -141,7 +160,8 @@ class FakeCamera:
     def publish_observation(self, observation: dict[str, Any], timestamp_s: float):
         del observation
         self.published += 1
-        return _FrameReference(self.published, timestamp_s, object())
+        self.frame = object()
+        return _FrameReference(self.published, timestamp_s, self.frame)
 
     def start_recording(self, path: Path, episode_start_s: float, output_fps: float) -> None:
         self.recording = True
@@ -209,10 +229,11 @@ def fake_policy_info(**overrides: Any) -> PolicyInfo:
 
 class Harness:
     def __init__(self, fail_after: int | None = None, move_delay_s: float = 0.0,
-                 supports_guidance: bool = False) -> None:
+                 supports_guidance: bool = False, goal_conditioned: bool = False) -> None:
         self.robot = FakeRobot(fail_after)
         self.runner = FakeRunner()
         self.supports_guidance = supports_guidance
+        self.goal_conditioned = goal_conditioned
         self.camera: FakeCamera | None = None
         self.emergency_calls = 0
         self.policy_calls = 0
@@ -249,6 +270,8 @@ class Harness:
                 checkpoint=str(settings.checkpoint),
                 supports_guidance=self.supports_guidance,
                 guidance_weight=settings.guidance_weight or 1.0,
+                goal_conditioned=self.goal_conditioned,
+                has_goal=self.runner.has_goal,
             ),
         )
 
@@ -579,6 +602,71 @@ class PolicyRuntimeTest(unittest.TestCase):
                 self.assertIn(key, action)
                 self.assertIn(key, observation)
         self.assertFalse((saved / "video.avi").exists())
+
+    def test_the_operator_judgement_reaches_the_saved_episode(self) -> None:
+        self._load_policy()
+        self.runtime.connect(runtime_config())
+        self.runtime.start_rollout(RolloutConfig(output_dir=self.output_dir, duration_s=None))
+        wait_until(lambda: self.runtime.get_snapshot().rollout_samples >= 5)
+        self.runtime.stop_rollout()
+
+        self.assertIsNone(self.runtime.get_snapshot().draft.outcome)
+        self.runtime.set_rollout_outcome("failure")
+        # Changing one's mind before saving is the normal case, not an error.
+        self.runtime.set_rollout_outcome("success")
+        self.assertEqual(self.runtime.get_snapshot().draft.outcome, "success")
+
+        saved = self.runtime.save_rollout()
+        meta = json.loads((saved / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["outcome"], "success")
+        self.assertEqual(count_outcomes(self.output_dir), {"success": 1, "failure": 0, "unjudged": 0})
+
+    def test_an_unjudged_episode_is_saved_with_a_null_outcome(self) -> None:
+        self._load_policy()
+        self.runtime.connect(runtime_config())
+        self.runtime.start_rollout(RolloutConfig(output_dir=self.output_dir, duration_s=None))
+        wait_until(lambda: self.runtime.get_snapshot().rollout_samples >= 5)
+        self.runtime.stop_rollout()
+        saved = self.runtime.save_rollout()
+
+        meta = json.loads((saved / "meta.json").read_text(encoding="utf-8"))
+        self.assertIsNone(meta["outcome"])
+        self.assertEqual(count_outcomes(self.output_dir)["unjudged"], 1)
+
+    def test_a_rollout_cannot_be_judged_while_it_is_still_running(self) -> None:
+        self._load_policy()
+        self.runtime.connect(runtime_config())
+        self.runtime.start_rollout(RolloutConfig(output_dir=self.output_dir, duration_s=None))
+        wait_until(lambda: self.harness.robot.send_count() >= 2)
+        with self.assertRaises(RuntimeError):
+            self.runtime.set_rollout_outcome("success")
+        self.runtime.stop_rollout()
+        self.runtime.discard_rollout()
+
+    def test_only_the_two_verdicts_are_accepted(self) -> None:
+        self._load_policy()
+        self.runtime.connect(runtime_config())
+        self.runtime.start_rollout(RolloutConfig(output_dir=self.output_dir, duration_s=None))
+        wait_until(lambda: self.runtime.get_snapshot().rollout_samples >= 2)
+        self.runtime.stop_rollout()
+        with self.assertRaises(ValueError):
+            self.runtime.set_rollout_outcome("maybe")
+        self.runtime.discard_rollout()
+
+    def test_there_is_nothing_to_judge_before_a_rollout_runs(self) -> None:
+        self._load_policy()
+        self.runtime.connect(runtime_config())
+        with self.assertRaises(RuntimeError):
+            self.runtime.set_rollout_outcome("success")
+
+    def test_judging_is_reachable_across_the_process_boundary(self) -> None:
+        self.assertIn("set_rollout_outcome", _PROCESS_OPERATIONS)
+
+    def test_count_outcomes_ignores_a_directory_that_does_not_exist(self) -> None:
+        self.assertEqual(
+            count_outcomes(self.output_dir / "nowhere"),
+            {"success": 0, "failure": 0, "unjudged": 0},
+        )
 
     def test_discard_removes_the_pending_directory(self) -> None:
         self._load_policy()

@@ -95,8 +95,16 @@ class GaussianDiffusion(nn.Module):
         generator: torch.Generator | None = None,
         initial_noise: torch.Tensor | None = None,
         callback: Callable[[int, int, torch.Tensor], None] | None = None,
+        epsilon_transform: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Sample a video with DDIM; ``eta=0`` is deterministic given the noise."""
+        """Sample a video with DDIM; ``eta=0`` is deterministic given the noise.
+
+        ``epsilon_transform(predicted_noise, video, timestep)`` may replace the
+        model's noise prediction before the DDIM update uses it. That is the
+        one place a guidance term belongs - classifier guidance is a correction
+        to the score, and the score is the noise prediction - and putting the
+        hook here keeps ``src/guidance`` from having to restate the sampler.
+        """
         if not 1 <= inference_steps <= self.timesteps:
             raise ValueError(
                 f"inference_steps must be in [1, {self.timesteps}], got {inference_steps}"
@@ -128,6 +136,8 @@ class GaussianDiffusion(nn.Module):
             next_timestep = int(times[index + 1].item()) if index + 1 < len(times) else -1
             batch_times = torch.full((shape[0],), timestep, device=device, dtype=torch.long)
             predicted_noise = model(video, batch_times, condition)
+            if epsilon_transform is not None:
+                predicted_noise = epsilon_transform(predicted_noise, video, timestep)
 
             alpha = self.alpha_bars[timestep].to(device=device, dtype=video.dtype)
             predicted_clean = (

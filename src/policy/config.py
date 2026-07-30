@@ -28,10 +28,14 @@ POOL = "spatial_softmax"
 DELTA_MODES = ("incremental", "anchored")
 ACTION_REPRS = ("absolute", "delta")
 NORM_MODES = ("meanstd", "minmax", "identity")
+# Which frame of an episode becomes the goal; ``policy.goal`` implements both
+# and re-exports this. It lives here because the config is the leaf module -
+# policy.goal imports policy.config, not the other way round.
+GOAL_SELECTIONS = ("uniform4", "tail")
 
 __all__ = [
-    "ACTION_REPRS", "BETA_SCHEDULES", "DELTA_MODES", "FLOW_TIME_SAMPLINGS", "NORM_MODES",
-    "OBJECTIVES", "POLICY_KIND", "POOL", "PolicyConfig", "VISION", "target_stats",
+    "ACTION_REPRS", "BETA_SCHEDULES", "DELTA_MODES", "FLOW_TIME_SAMPLINGS", "GOAL_SELECTIONS",
+    "NORM_MODES", "OBJECTIVES", "POLICY_KIND", "POOL", "PolicyConfig", "VISION", "target_stats",
 ]
 
 
@@ -84,12 +88,22 @@ class PolicyConfig:
     flow_time_sampling: str = "uniform"
 
     # --- goal conditioning (implemented in policy.goal) ---
-    # When set, the model also sees a goal frame drawn from the last
-    # ``goal_window`` frames of the episode, encoded by the same ResNet and
-    # appended to the conditioning vector. ``goal_dropout`` replaces that frame
-    # with a learned null embedding at training time, which is what makes a
-    # goal-conditioned checkpoint runnable with no goal at all.
+    # When set, the model also sees a goal frame drawn from the episode it is
+    # training on, encoded by the same ResNet and appended to the conditioning
+    # vector. ``goal_dropout`` replaces that frame with a learned null embedding
+    # at training time, which is what makes a goal-conditioned checkpoint
+    # runnable with no goal at all.
+    #
+    # ``goal_selection`` decides which frame. "uniform4" samples goal_frames
+    # frames evenly across the episode and takes goal_frame_index of them -
+    # the same rule src/diffusion generates video under, so the goal a video
+    # model hands over at inference is the kind of picture training used.
+    # "tail" is the older rule: a picture of the finished task. In both cases
+    # the episode's end is drawn from its last ``goal_window`` frames.
     goal_conditioned: bool = False
+    goal_selection: str = "uniform4"
+    goal_frames: int = 4
+    goal_frame_index: int = 2
     goal_window: int = 10
     goal_dropout: float = 0.0
 
@@ -172,6 +186,16 @@ class PolicyConfig:
 
         if self.goal_window < 1:
             raise ValueError(f"goal_window must be >= 1, got {self.goal_window}")
+        if self.goal_selection not in GOAL_SELECTIONS:
+            raise ValueError(
+                f"goal_selection must be one of {GOAL_SELECTIONS}, got {self.goal_selection!r}"
+            )
+        if self.goal_frames < 2:
+            raise ValueError(f"goal_frames must be >= 2, got {self.goal_frames}")
+        if not 0 <= self.goal_frame_index < self.goal_frames:
+            raise ValueError(
+                f"goal_frame_index must be in [0, {self.goal_frames}), got {self.goal_frame_index}"
+            )
         if not 0.0 <= self.goal_dropout < 1.0:
             raise ValueError(f"goal_dropout must be in [0, 1), got {self.goal_dropout}")
         if self.goal_dropout > 0.0 and not self.goal_conditioned:

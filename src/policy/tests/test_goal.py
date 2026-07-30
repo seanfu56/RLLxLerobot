@@ -17,6 +17,7 @@ from policy.goal import (
     goal_offset_range,
     is_goal_conditioned,
     load_runner,
+    uniform_frame_offsets,
 )
 from policy.inference import PolicyRunner
 from policy.model import ChunkPolicy
@@ -89,16 +90,16 @@ class GoalDatasetTests(unittest.TestCase):
         self.assertEqual(sample["goal_image"].dtype, torch.uint8)
         self.assertEqual(sample["image"].shape, (2, 3, 32, 32))
 
-    def test_a_pinned_goal_is_the_final_frame_of_the_episode(self) -> None:
-        dataset = self._dataset(random_goal=False)
+    def test_a_pinned_tail_goal_is_the_final_frame_of_the_episode(self) -> None:
+        dataset = self._dataset(goal_selection="tail", random_goal=False)
         episode = self.bundle.episodes[0]
         expected = np.array(self.bundle.frames[episode.shard][episode.end - 1])
         np.testing.assert_array_equal(
             dataset[0]["goal_image"].permute(1, 2, 0).numpy(), expected
         )
 
-    def test_a_random_goal_stays_inside_the_window(self) -> None:
-        dataset = self._dataset(goal_window=10)
+    def test_a_random_tail_goal_stays_inside_the_window(self) -> None:
+        dataset = self._dataset(goal_selection="tail", goal_window=10)
         episode = self.bundle.episodes[0]
         tail = {
             bytes(np.array(self.bundle.frames[episode.shard][episode.end - offset]).data)
@@ -111,6 +112,56 @@ class GoalDatasetTests(unittest.TestCase):
         self.assertTrue(drawn <= tail)
         # 40 draws from 10 frames landing on one of them would be a stuck index.
         self.assertGreater(len(drawn), 1)
+
+    def test_a_pinned_uniform4_goal_is_two_thirds_through_the_episode(self) -> None:
+        dataset = self._dataset(random_goal=False)
+        episode = self.bundle.episodes[0]
+        # 30 frames, so the pinned end is offset 29 and the four sampled offsets
+        # are 0, 10, 19, 29. The third of them is the goal.
+        self.assertEqual(uniform_frame_offsets(29), [0, 10, 19, 29])
+        expected = np.array(self.bundle.frames[episode.shard][episode.start + 19])
+        np.testing.assert_array_equal(
+            dataset[0]["goal_image"].permute(1, 2, 0).numpy(), expected
+        )
+
+    def test_a_random_uniform4_goal_moves_with_the_sampled_endpoint(self) -> None:
+        """The endpoint comes from the tail window, so the goal moves a little.
+
+        With a 30-frame episode and a 10-frame window the endpoint is one of
+        20..29, which puts the two-thirds frame at offsets 13..19 - well before
+        the end, and never in the tail the old rule drew from.
+        """
+        dataset = self._dataset(goal_window=10)
+        episode = self.bundle.episodes[0]
+        reachable = {
+            bytes(np.array(self.bundle.frames[episode.shard][episode.start + offset]).data)
+            for offset in range(13, 20)
+        }
+        drawn = {
+            bytes(dataset[0]["goal_image"].permute(1, 2, 0).contiguous().numpy().data)
+            for _ in range(40)
+        }
+        self.assertTrue(drawn <= reachable)
+        self.assertGreater(len(drawn), 1)
+
+    def test_the_uniform_rule_is_the_one_the_video_model_generates_under(self) -> None:
+        """src/diffusion generates frames 1-3 of four; the goal is its frame 3.
+
+        These two expressions have to agree exactly or the policy is trained on
+        one frame of the episode and handed another at inference.
+        """
+        from diffusion.data import four_frame_indices
+
+        for last in range(3, 400):
+            self.assertEqual(tuple(uniform_frame_offsets(last, 4)), four_frame_indices(last + 1, last))
+
+    def test_the_goal_selection_rule_must_be_one_of_the_two(self) -> None:
+        with self.assertRaises(ValueError):
+            self._dataset(goal_selection="whatever")
+
+    def test_the_goal_frame_index_must_be_inside_the_sampled_frames(self) -> None:
+        with self.assertRaises(ValueError):
+            self._dataset(goal_frames=4, goal_frame_index=4)
 
     def test_the_goal_is_redrawn_between_epochs_but_pinned_for_validation(self) -> None:
         random = self._dataset()
@@ -425,6 +476,11 @@ class GoalArgumentTests(unittest.TestCase):
         self.assertFalse(args.goal_conditioned)
         self.assertEqual(args.goal_window, 10)
         self.assertEqual(args.goal_dropout, 0.0)
+
+    def test_the_default_goal_is_the_third_of_four_sampled_frames(self) -> None:
+        args = parse_args(["--bundle", "tiny", "--goal-conditioned"])
+        self.assertEqual(args.goal_selection, "uniform4")
+        self.assertEqual((args.goal_frames, args.goal_frame_index), (4, 2))
 
     def test_goal_flags_without_goal_conditioning_are_flagged(self) -> None:
         from policy.train import warn_about_ignored_flags

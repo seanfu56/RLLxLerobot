@@ -242,6 +242,11 @@ class CameraBackend(Protocol):
 
     def snapshot(self) -> Mapping[str, float | int | None]: ...
 
+    # The most recent captured frame, or None before the first observation.
+    # Only the goal-conditioned policy page uses it, to hand the video model
+    # the scene the rollout is about to start from.
+    def latest_frame(self) -> Any | None: ...
+
 
 @dataclass(frozen=True)
 class _ControlSample:
@@ -964,6 +969,11 @@ class _ObservationCameraSystem:
     def _get_latest(self) -> tuple[int, float, Any] | None:
         with self._lock:
             return self._latest
+
+    def latest_frame(self) -> Any | None:
+        """The most recent captured frame, or None before the first observation."""
+        latest = self._get_latest()
+        return None if latest is None else latest[2]
 
 
 def _default_camera_factory(

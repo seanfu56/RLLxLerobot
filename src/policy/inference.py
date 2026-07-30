@@ -260,6 +260,9 @@ class PolicyRunner:
             "guidance_weight": self.guidance_weight,
             "cond_dropout": self.config.cond_dropout,
             "goal_conditioned": self.config.goal_conditioned,
+            "goal_selection": self.config.goal_selection,
+            "goal_frames": self.config.goal_frames,
+            "goal_frame_index": self.config.goal_frame_index,
             "goal_window": self.config.goal_window,
             "goal_dropout": self.config.goal_dropout,
         }

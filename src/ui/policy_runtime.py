@@ -84,6 +84,11 @@ DEFAULT_PREVIEW_PATH = DEFAULT_STATIC_PATH.with_name("policy_live.jpg")
 DEFAULT_MODEL_ROOT = Path("models/sweeps")
 DEFAULT_OUTPUT_DIR = Path("outputs/policy_eval")
 
+# What an operator can say about a finished rollout. The label is the whole
+# point of running evaluation episodes: it is the success rate, and it is the
+# preference signal src/finetune turns into DPO pairs.
+OUTCOMES = ("success", "failure")
+
 
 class PolicyState(str, Enum):
     DISCONNECTED = "DISCONNECTED"
@@ -250,6 +255,8 @@ class RolloutSnapshot:
     duration_s: float
     running: bool
     recorded: bool
+    # "success", "failure", or None while the operator has not judged it yet.
+    outcome: str | None = None
 
 
 @dataclass(frozen=True)
@@ -320,6 +327,7 @@ class _RolloutDraft:
     missed_frames: int = 0
     video: VideoResult | None = None
     running: bool = True
+    outcome: str | None = None
 
 
 def _default_hardware_factory(config: PolicyRuntimeConfig) -> PolicyHardwareBundle:
@@ -435,6 +443,23 @@ class _PolicyDriver:
             )
         setter(weight)
         self.info = replace(self.info, guidance_weight=float(weight))
+
+    def set_goal(self, frame_bgr: Any | None) -> None:
+        """Point the policy at a goal frame, or take its goal away.
+
+        ``GoalPolicyRunner.set_goal`` drops the queued chunk, so actions planned
+        for the previous goal cannot reach the arm after the change.
+        """
+        if not self.info.goal_conditioned:
+            raise RuntimeError(
+                f"{self.info.run_name} was not trained with --goal-conditioned, so it has "
+                "nowhere to put a goal frame."
+            )
+        if frame_bgr is None:
+            self.runner.clear_goal()
+        else:
+            self.runner.set_goal(frame_bgr)
+        self.info = replace(self.info, has_goal=bool(getattr(self.runner, "has_goal", False)))
 
     def act(
         self, frame: Any, state: Any
@@ -1199,6 +1224,11 @@ class PolicyRuntime:
                 "task": draft.config.task,
                 "episode_index": draft.episode_index,
                 "source": "policy_rollout",
+                # The operator's verdict, or null when the episode was saved
+                # unjudged. src/finetune reads this key to build DPO pairs and
+                # src/guidance to label its classifier, so it is written even
+                # when it is null rather than being left out.
+                "outcome": draft.outcome,
                 "duration_s": round(stopped_s - draft.started_s, 6),
                 "action_sample_hz_target": control_hz,
                 "action_samples": len(draft.rows),
@@ -1240,6 +1270,27 @@ class PolicyRuntime:
                 self._draft = None
             return final_dir
 
+    def set_rollout_outcome(self, outcome: str | None) -> PolicySnapshot:
+        """Record the operator's judgement of the finished rollout.
+
+        Only a finished rollout can be judged: while the arm is still driving
+        nobody knows yet whether the episode worked, and a label applied mid
+        -rollout would be attached to an episode that then went on to fail.
+        The label is written into the episode's ``meta.json`` by ``save_rollout``
+        and is what turns a directory of trials into a success rate.
+        """
+        if outcome is not None and outcome not in OUTCOMES:
+            raise ValueError(f"outcome must be one of {OUTCOMES} or None, got {outcome!r}")
+        with self._command_lock:
+            with self._lock:
+                if self._state is PolicyState.RUNNING:
+                    raise RuntimeError("Stop the rollout before judging it.")
+                draft = self._draft
+                if draft is None or draft.running:
+                    raise RuntimeError("There is no finished rollout to judge.")
+                draft.outcome = outcome
+            return self.get_snapshot()
+
     def discard_rollout(self) -> PolicySnapshot:
         with self._command_lock:
             if self.state is PolicyState.RUNNING:
@@ -1275,6 +1326,70 @@ class PolicyRuntime:
             if driver is None:
                 raise RuntimeError("Load a checkpoint before setting a guidance weight.")
             driver.set_guidance_weight(float(weight))
+            return self.get_snapshot()
+
+    # ------------------------------------------------------------------
+    # goal conditioning
+    # ------------------------------------------------------------------
+
+    def generate_goal_video(self, config: Any) -> Any:
+        """Ask the configured video model what should happen from the current frame.
+
+        The camera frame is read here rather than in the browser: it has to be
+        the scene the rollout is about to start from, and a frame the operator
+        screenshotted a minute ago is a different scene. Refused while the arm
+        is driving - the goal is fixed for a rollout, and generating a new one
+        mid-episode would be planning against a scene that has already moved.
+        """
+        try:
+            from ui.video_goal import generate_goal_video
+        except ModuleNotFoundError:
+            from video_goal import generate_goal_video
+
+        with self._command_lock:
+            with self._lock:
+                if self._state is PolicyState.RUNNING:
+                    raise RuntimeError("Stop the rollout before generating a new goal.")
+                if self._state is not PolicyState.IDLE:
+                    raise RuntimeError(
+                        f"The camera is not running; the runtime is {self._state.value}."
+                    )
+                camera = self._camera
+            if camera is None:
+                raise RuntimeError("Hardware is not connected.")
+            frame = camera.latest_frame()
+            if frame is None:
+                raise RuntimeError(
+                    "No camera frame has been captured yet. Wait for the live preview."
+                )
+            return generate_goal_video(config, frame)
+
+    def set_goal_frame(self, frame_png: bytes | None) -> PolicySnapshot:
+        """Give the loaded policy its goal, as one PNG-encoded frame.
+
+        A PNG rather than an array because this crosses a process pipe, and
+        rather than an index into the generated video because the runtime does
+        not keep that video: it is handed to the browser once and the browser
+        decides which frame it wants.
+        """
+        with self._command_lock:
+            with self._lock:
+                if self._state is PolicyState.RUNNING:
+                    raise RuntimeError("Stop the rollout before changing the goal.")
+                driver = self._driver
+            if driver is None:
+                raise RuntimeError("Load a checkpoint before setting a goal.")
+            if frame_png is None:
+                driver.set_goal(None)
+                return self.get_snapshot()
+
+            import cv2
+            import numpy as np
+
+            decoded = cv2.imdecode(np.frombuffer(frame_png, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if decoded is None:
+                raise ValueError("The goal frame could not be decoded; expected a PNG.")
+            driver.set_goal(decoded)
             return self.get_snapshot()
 
     # ------------------------------------------------------------------
@@ -1335,6 +1450,7 @@ class PolicyRuntime:
                 duration_s=rollout_elapsed_s,
                 running=draft.running,
                 recorded=draft.pending_dir is not None,
+                outcome=draft.outcome,
             )
 
         average_period = sum(periods) / len(periods) if periods else 0.0
@@ -1624,6 +1740,28 @@ class PolicyRuntime:
                     self._worker_failed("rollout_timeout", exc)
 
 
+def count_outcomes(output_dir: Path | str) -> dict[str, int]:
+    """Tally the judged episodes already saved under ``output_dir``.
+
+    Reads only ``meta.json``, so a directory of a hundred episodes costs a
+    hundred small reads and no video decoding. ``unjudged`` counts episodes
+    saved before an outcome was picked - they are still valid recordings, they
+    just cannot contribute to a success rate or to a preference pair.
+    """
+    counts = {"success": 0, "failure": 0, "unjudged": 0}
+    directory = Path(output_dir).expanduser()
+    if not directory.is_dir():
+        return counts
+    for meta_path in sorted(directory.glob("episode_*/meta.json")):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        outcome = meta.get("outcome")
+        counts[outcome if outcome in OUTCOMES else "unjudged"] += 1
+    return counts
+
+
 def _policy_meta(policy: PolicyInfo | None) -> dict[str, Any] | None:
     if policy is None:
         return None
@@ -1663,10 +1801,13 @@ _PROCESS_OPERATIONS = frozenset(
         "start_rollout",
         "stop_rollout",
         "save_rollout",
+        "set_rollout_outcome",
         "discard_rollout",
         "return_to_start",
         "set_preview_enabled",
         "set_guidance_weight",
+        "generate_goal_video",
+        "set_goal_frame",
         "get_snapshot",
     }
 )
@@ -1786,6 +1927,9 @@ class ProcessPolicyRuntime:
             raise RuntimeError("Runtime process returned an invalid saved episode path.")
         return result
 
+    def set_rollout_outcome(self, outcome: str | None) -> PolicySnapshot:
+        return self._snapshot_rpc("set_rollout_outcome", outcome, timeout_s=10.0)
+
     def discard_rollout(self) -> PolicySnapshot:
         if not self._has_process():
             return self.get_snapshot()
@@ -1798,6 +1942,15 @@ class ProcessPolicyRuntime:
 
     def set_guidance_weight(self, weight: float) -> PolicySnapshot:
         return self._snapshot_rpc("set_guidance_weight", weight, timeout_s=10.0)
+
+    # Generation is the slow half of a goal-conditioned rollout: a 93-frame
+    # Cosmos clip is seconds of transformer, and the first call also pays for
+    # loading the model behind whichever source is configured.
+    def generate_goal_video(self, config: Any) -> Any:
+        return self._rpc("generate_goal_video", config, timeout_s=600.0)
+
+    def set_goal_frame(self, frame_png: bytes | None) -> PolicySnapshot:
+        return self._snapshot_rpc("set_goal_frame", frame_png, timeout_s=30.0)
 
     def get_snapshot(self) -> PolicySnapshot:
         if not self._has_process():
