@@ -81,27 +81,37 @@ before the resize, the same crop `src/diffusion` and `src/policy` use:
 ```
 
 `pick-can-all` is 60 episodes over two shards (`pick-can-m1`, `pick-can-m2`),
-114–169 frames each at 20 FPS. Six episodes are held out for validation.
+114–169 frames each at 20 FPS. Six episodes are held out for validation,
+stratified as three from each shard. Training samples are source-balanced every
+epoch, so neither motion family can dominate through episode count.
 
 Two clip modes:
 
-- `window` (default) — a contiguous 93-frame window at the native 20 FPS. The
-  start is redrawn on every access during training, which is the only
-  augmentation used; validation takes the centered window so its loss is
-  comparable across steps. 93 frames is 4.65 s, and the shortest episode is
-  114 frames, so every episode admits at least 22 distinct windows.
-- `episode` — the whole episode uniformly resampled to 93 frames. Playback is
+- `episode` (training default) — the whole episode uniformly resampled to 93
+  frames. It always uses the true first frame, matching first-frame-conditioned
+  inference, and includes the complete demonstrated motion. Playback is
   retimed, so the reported FPS is scaled to preserve the real duration
   (a 167-frame episode becomes 93 frames at 11.1 FPS, still 8.35 s).
+- `window` — a contiguous 93-frame window at the native 20 FPS. It remains
+  available for ablations, but random later windows can reveal which motion is
+  already under way and therefore do not match true-first-frame inference.
 
 `num_frames` must satisfy `(num_frames - 1) % 4 == 0` (Wan VAE temporal
 compression) and the resolution must be a multiple of 16. At 256×256×93 the
 joint sequence carries 1,536 vision tokens.
 
 Text conditioning comes from `captions.json`, keyed by the episode `task`
-string. Note the recorded task label is `"pick up cube"` but the object is
-actually a Sprite can; the caption describes what the video shows, not the
-label. Override every caption with `--caption "..."`.
+string. Captions describe what the video shows, not the label, and one caption
+covers both recording modes of a bundle (`*-m1` and `*-m2`), since the two modes
+differ only in how the demonstration is executed.
+
+Note that the recorded task label in `piper-data/raw/*/episode_*/meta.json` —
+and therefore in the generated `shard.json` — is `"pick up cube"` for every
+bundle, a stale default from the recording script. `captions.json` is keyed by
+the real tasks (`"pick up can"`, `"pick up scissors"`), so the shards must be
+relabelled before training, otherwise `load_episodes` looks up `"pick up cube"`
+and the run aborts with `No caption for task(s) ['pick up cube']`. Alternatively
+override every caption with `--caption "..."`.
 
 ## Train
 
@@ -115,7 +125,9 @@ python src/cosmos/train.py --bundle piper-data/dataset/pick-can-all
 has no batch dimension, so a step is one clip and `--grad-accum` (default 8)
 provides the effective batch size. Defaults: 1000 optimizer steps, LoRA rank
 32, LR 1e-4 with 20 warmup steps decaying to 0.1×, 10% caption dropout for
-classifier-free guidance, and bf16.
+classifier-free guidance, and bf16. LoRA covers the generation attention,
+generation-specific feed-forward layers, and vision input/output projections;
+the separate understanding/text pathway remains frozen.
 
 For both GPUs:
 
@@ -151,22 +163,96 @@ uint8, what `cv2.VideoCapture` gives and what
 `policy.inference.PolicyRunner.select_action` expects. It is center-cropped
 square and resized exactly the way training preprocessed the recordings.
 
-### 1. Offline, against the dataset
+### 1. Offline sampling
+
+Use every captured first frame in `snapshots/pick-can` in timestamp order while
+loading the model only once:
+
+```bash
+python src/cosmos/sample.py \
+  --adapter models/cosmos3_nano_lora/pick-can-all/adapter \
+  --images-dir snapshots/pick-can
+```
+
+Each 640×480 snapshot is center-cropped before resizing, matching training.
+Its filename stem and sampling seed are retained in the generated MP4 name.
+
+Without `--image` or `--images-dir`, the sampler uses the held-out dataset:
 
 ```bash
 python src/cosmos/sample.py --adapter models/cosmos3_nano_lora/pick-can-all/adapter
 ```
 
 Reproduces the training split (keep `--val-episodes` / `--split-seed` in sync),
-conditions on each held-out episode's first frame, and writes the generation
-next to the ground-truth clip it should match. Pass `--adapter ""` for the base
-model — running both is the comparison worth making.
+conditions on each held-out episode's first frame, and writes four independent
+Flow-Matching trajectories next to the ground-truth clip they should match.
+The sampler chooses a fresh random base seed on each invocation; pass
+`--seed 1000` for a reproducible seed sequence or
+`--samples-per-condition 1` for the previous single-output behavior. Pass
+`--adapter ""` for the base model — running both with the same explicit seed is
+the comparison worth making.
 
 ```text
-samples/cosmos3-nano/<shard>_<episode>_lora.mp4        with the adapter
-samples/cosmos3-nano/<shard>_<episode>_base.mp4        without it
-samples/cosmos3-nano/<shard>_<episode>_reference.mp4   ground truth
+samples/cosmos3-nano/<shard>_<episode>_lora_seed<N>.mp4   with the adapter
+samples/cosmos3-nano/<shard>_<episode>_base_seed<N>.mp4   without it
+samples/cosmos3-nano/<shard>_<episode>_reference.mp4      ground truth
 ```
+
+Why seeds matter: the rectified Flow-Matching model transports an initial
+Gaussian latent through a deterministic ODE. Reusing one seed therefore
+reuses one trajectory; it cannot expose the conditional distribution's mode
+coverage. Each variant now starts from an independent Gaussian latent.
+Classifier-free guidance is the second diversity control: stronger guidance
+usually improves prompt adherence at the cost of mode coverage. The official
+Cosmos value remains the default (`--guidance-scale 6`); try
+`--guidance-scale 3` when diversity matters more, and compare both settings
+with the same explicit seed sequence. `--flow-shift` changes which noise levels
+the solver visits, not the random trajectory, so it remains at the official
+Cosmos value of 10.
+
+### DiverseFlow inference
+
+`sample.py` also implements the training-free coupled inference method from
+**DiverseFlow: Sample-Efficient Diverse Mode Coverage in Flows**. At every
+Euler step it predicts the clean endpoint of all `K` trajectories, builds a
+DPP kernel over their trajectory features, and adds the normalized gradient of
+the DPP log-likelihood to the reverse-time flow. The first image-conditioning
+latent is masked out of both the feature and the gradient, then restored after
+every step.
+
+Run the low-memory latent-feature version on all supplied first frames:
+
+```bash
+python src/cosmos/sample.py \
+  --adapter models/cosmos3_nano_lora/pick-can-all/adapter \
+  --images-dir snapshots/pick-can \
+  --sampler diverse-flow \
+  --samples-per-condition 4 \
+  --seed 1000 \
+  --guidance-scale 3 \
+  --diversity-feature latent \
+  --diversity-scale 1
+```
+
+Outputs include the sampler in the name, for example
+`snapshot_..._lora_diverse_seed1000.mp4`, so they do not overwrite the UniPC
+baseline. Use `--diversity-scale 0` for an IID Euler solver control with the
+same seeds.
+
+For the paper-aligned visual objective, use
+`--diversity-feature dino`. It decodes several ordered generated frames and
+backpropagates through the frozen VAE and DINOv2 model. This is much more
+expensive than latent guidance: each guided Euler step needs a differentiable
+VAE/DINO pass for every particle. The implementation recomputes those paths
+one particle at a time so their activation graphs do not all occupy VRAM at
+once. `--diversity-every 2` or `4` trades some guidance fidelity for runtime.
+
+The Gaussian-source quality constraint is enabled at the 99.5th percentile by
+default and excludes the clean condition latent. Pass `--quality-percentile 0`
+to ablate it. The image paper used a diversity scale of 20; video is much
+higher-dimensional, so this implementation starts conservatively at 1 and
+expects the scale to be swept against task-success and physical-quality
+metrics.
 
 ### 2. Direct, in-process
 

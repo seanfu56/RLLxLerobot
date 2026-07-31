@@ -14,9 +14,9 @@ step calls the pipeline's own helpers (``_encode_video``, ``tokenize_prompt``,
 ``_prepare_text_segment``, ``_prepare_vision_segment``) and only replaces the
 iterative denoising loop with a single random-timestep rectified-flow step.
 
-Only the generation pathway's attention projections are adapted; the
-understanding (text) pathway stays frozen, matching the official Cosmos3 LoRA
-SFT recipe.
+The generation pathway's attention projections, generation-specific MLP, and
+vision input/output projections are adapted. The separate understanding
+(text) pathway stays frozen.
 
 This script needs a much newer diffusers/transformers stack than the ``piper``
 conda environment provides -- see ``src/cosmos/README.md``.  Everything up to
@@ -29,6 +29,7 @@ import argparse
 import json
 import logging
 import os
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +45,7 @@ if __package__ in (None, ""):
         NUM_FRAMES,
         RESOLUTION,
         PiperClipDataset,
+        SourceBalancedSampler,
         check_geometry,
         collate_clip,
         load_captions,
@@ -63,6 +65,7 @@ else:
         NUM_FRAMES,
         RESOLUTION,
         PiperClipDataset,
+        SourceBalancedSampler,
         check_geometry,
         collate_clip,
         load_captions,
@@ -80,10 +83,21 @@ else:
 
 LOGGER = logging.getLogger("cosmos3-sft")
 
-# Generation-pathway attention projections in Cosmos3OmniTransformer's joint
-# attention block. The understanding-pathway projections (q_proj/k_proj/...)
-# are deliberately excluded so the text tower is untouched.
-LORA_TARGET_MODULES = ["add_q_proj", "add_k_proj", "add_v_proj", "to_add_out"]
+# Generation-pathway modules in Cosmos3OmniTransformer. The plain ``to_q`` /
+# ``to_k`` / ``to_v`` / ``to_out`` and ``mlp`` modules belong to the separate
+# understanding pathway and remain frozen. ``mlp_moe_gen`` is the video
+# pathway's feed-forward block.
+LORA_TARGET_MODULES = [
+    "add_q_proj",
+    "add_k_proj",
+    "add_v_proj",
+    "to_add_out",
+    "mlp_moe_gen.gate_proj",
+    "mlp_moe_gen.up_proj",
+    "mlp_moe_gen.down_proj",
+    "proj_in",
+    "proj_out",
+]
 
 DEFAULT_CAPTIONS = Path(__file__).resolve().parent / "captions.json"
 # Sigmas at which validation loss is measured. Fixed so the number is
@@ -117,10 +131,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     data.add_argument("--resolution", type=int, default=RESOLUTION, help="Square pixel resolution")
     data.add_argument("--num-frames", type=int, default=NUM_FRAMES)
-    data.add_argument("--clip-mode", choices=("window", "episode"), default="window")
-    data.add_argument("--val-episodes", type=int, default=6, help="Episodes held out for validation")
+    data.add_argument(
+        "--clip-mode",
+        choices=("window", "episode"),
+        default="episode",
+        help=(
+            "Episode mode preserves the true first-frame condition and complete motion; "
+            "window mode is retained for ablations"
+        ),
+    )
+    data.add_argument(
+        "--val-episodes",
+        type=int,
+        default=6,
+        help="Episodes held out proportionally from every source for validation",
+    )
     data.add_argument("--split-seed", type=int, default=42)
-    data.add_argument("--num-workers", type=int, default=2)
+    data.add_argument("--num-workers", type=int, default=8)
 
     model = parser.add_argument_group("model")
     model.add_argument("--pretrained", default="nvidia/Cosmos3-Nano")
@@ -301,10 +328,19 @@ def describe_plan(args, train_episodes, val_episodes, captions) -> dict:
     """Summary of everything resolved before the model is touched."""
     latent_frames = (args.num_frames - 1) // 4 + 1
     patches = (args.resolution // 16 // 2) ** 2
+    train_sources = Counter(episode.source for episode in train_episodes)
+    val_sources = Counter(episode.source for episode in val_episodes)
     return {
         "bundle": str(args.bundle),
         "train_episodes": len(train_episodes),
         "val_episodes": len(val_episodes),
+        "train_sources": dict(sorted(train_sources.items())),
+        "val_sources": dict(sorted(val_sources.items())),
+        "balanced_samples_per_epoch": (
+            len(SourceBalancedSampler(train_episodes, seed=args.seed))
+            if train_episodes
+            else 0
+        ),
         "clip": {
             "resolution": f"{args.resolution}x{args.resolution}",
             "num_frames": args.num_frames,
@@ -313,6 +349,7 @@ def describe_plan(args, train_episodes, val_episodes, captions) -> dict:
             "vision_tokens": latent_frames * patches,
         },
         "captions": captions,
+        "lora_targets": LORA_TARGET_MODULES,
         "effective_batch_size": args.grad_accum,
         "steps": args.steps,
     }
@@ -371,10 +408,11 @@ def main(argv: list[str] | None = None) -> None:
         random_window=True,
         seed=args.seed,
     )
+    train_sampler = SourceBalancedSampler(train_episodes, seed=args.seed)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=1,
-        shuffle=True,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=collate_clip,
         worker_init_fn=video_worker_init,

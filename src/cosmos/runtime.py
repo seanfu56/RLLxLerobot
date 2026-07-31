@@ -49,9 +49,10 @@ DEFAULT_FPS = 20.0
 DEFAULT_STEPS = 35
 DEFAULT_GUIDANCE = 6.0
 DEFAULT_FLOW_SHIFT = 10.0
+DEFAULT_TASK = "pick up can"
 
 
-def default_prompt(captions_path: str | Path = DEFAULT_CAPTIONS) -> str:
+def default_prompt(captions_path: str | Path = DEFAULT_CAPTIONS, task=DEFAULT_TASK) -> str:
     """The caption to use when a caller does not supply one.
 
     Single-task bundles have exactly one caption, so there is an unambiguous
@@ -59,12 +60,18 @@ def default_prompt(captions_path: str | Path = DEFAULT_CAPTIONS) -> str:
     of several tasks would be a subtle way to condition on the wrong thing.
     """
     captions = json.loads(Path(captions_path).expanduser().read_text(encoding="utf-8"))
-    if len(captions) != 1:
+    if len(captions) < 1:
         raise ValueError(
             f"{captions_path} holds {len(captions)} captions, so there is no unambiguous "
             f"default; pass prompt=... explicitly. Tasks: {sorted(captions)}"
         )
-    return next(iter(captions.values()))
+    elif len(captions) > 1 and task not in captions:
+        raise ValueError(
+            f"{captions_path} holds {len(captions)} captions, so there is no unambiguous "
+            f"default; pass prompt=... explicitly. Tasks: {sorted(captions)}"
+        )
+    else:
+        return captions[task] if task in captions else next(iter(captions.values()))
 
 
 def prepare_condition_frame(frame: np.ndarray | Image.Image, resolution: int) -> Image.Image:
@@ -99,6 +106,7 @@ class CosmosRunner:
         flow_shift: float = DEFAULT_FLOW_SHIFT,
         negative_prompt: str = DEFAULT_NEGATIVE,
         prompt: str | None = None,
+        task: str = DEFAULT_TASK,
         dtype: torch.dtype = torch.bfloat16,
     ):
         check_geometry(resolution, num_frames)

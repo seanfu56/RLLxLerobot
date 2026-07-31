@@ -17,12 +17,13 @@ Two clip modes are supported:
 
 ``window``
     A contiguous ``num_frames`` window at the recording's native 20 FPS.  The
-    window start is redrawn every time an episode is requested during training,
-    which is the only data augmentation used here.  Validation uses the
-    centered window so the loss is comparable across steps.
+    start may be random or centered. This remains available for experiments,
+    but it is not the training default because a later window leaks information
+    about which motion is already under way.
 ``episode``
     The whole episode uniformly resampled to ``num_frames``.  Playback is
     retimed, so the reported FPS is scaled to keep the clip's real duration.
+    It always starts at the true first frame and is the training default.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 # AutoencoderKLWan compresses 16x spatially and 4x temporally, and the
 # transformer patchifies latents 2x2, so the pixel resolution must be a
@@ -169,7 +170,12 @@ def load_episodes(bundle_dir: str | Path) -> list[Episode]:
 def split_episodes(
     episodes: Sequence[Episode], val_episodes: int, seed: int
 ) -> tuple[list[Episode], list[Episode]]:
-    """Hold out whole episodes so no clip can straddle the split."""
+    """Hold out whole episodes, stratified by their source shard.
+
+    The allocation is proportional for unequal shards and uses largest
+    remainders to reach exactly ``val_episodes``. At least one episode from
+    every source is kept for training.
+    """
     if val_episodes < 0:
         raise ValueError(f"val_episodes must be non-negative, got {val_episodes}")
     if val_episodes == 0:
@@ -178,11 +184,100 @@ def split_episodes(
         raise ValueError(
             f"val_episodes={val_episodes} leaves no training episodes out of {len(episodes)}"
         )
+
+    source_indexes: dict[str, list[int]] = {}
+    for index, episode in enumerate(episodes):
+        source_indexes.setdefault(episode.source, []).append(index)
+
+    capacity = {
+        source: max(len(indexes) - 1, 0)
+        for source, indexes in source_indexes.items()
+    }
+    maximum_holdout = sum(capacity.values())
+    if val_episodes > maximum_holdout:
+        raise ValueError(
+            f"val_episodes={val_episodes} cannot keep at least one training episode "
+            f"for every source; maximum stratified holdout is {maximum_holdout}"
+        )
+
+    total = len(episodes)
+    ideal = {
+        source: val_episodes * len(indexes) / total
+        for source, indexes in source_indexes.items()
+    }
+    quotas = {
+        source: min(int(np.floor(ideal[source])), capacity[source])
+        for source in source_indexes
+    }
+    remaining = val_episodes - sum(quotas.values())
+    ordered_sources = sorted(source_indexes)
+    while remaining:
+        candidates = [
+            source
+            for source in ordered_sources
+            if quotas[source] < capacity[source]
+        ]
+        if not candidates:
+            raise RuntimeError("Could not allocate the requested stratified holdout")
+        source = max(
+            candidates,
+            key=lambda name: (
+                ideal[name] - quotas[name],
+                len(source_indexes[name]),
+            ),
+        )
+        quotas[source] += 1
+        remaining -= 1
+
     rng = np.random.default_rng(seed)
-    held_out = {int(index) for index in rng.permutation(len(episodes))[:val_episodes]}
+    held_out: set[int] = set()
+    for source in ordered_sources:
+        indexes = np.asarray(source_indexes[source], dtype=np.int64)
+        selected = rng.permutation(indexes)[: quotas[source]]
+        held_out.update(int(index) for index in selected)
+
     train = [episode for index, episode in enumerate(episodes) if index not in held_out]
     val = [episode for index, episode in enumerate(episodes) if index in held_out]
     return train, val
+
+
+class SourceBalancedSampler(Sampler[int]):
+    """Yield an exactly source-balanced, shuffled set of episode indexes.
+
+    Every source contributes as many examples as the largest source. Smaller
+    sources are repeated only when necessary. A new deterministic shuffle is
+    drawn whenever the DataLoader starts another epoch.
+    """
+
+    def __init__(self, episodes: Sequence[Episode], seed: int = 0):
+        if not episodes:
+            raise ValueError("SourceBalancedSampler needs at least one episode")
+        self.seed = int(seed)
+        self._epoch = 0
+        self._source_indexes: dict[str, list[int]] = {}
+        for index, episode in enumerate(episodes):
+            self._source_indexes.setdefault(episode.source, []).append(index)
+        self._samples_per_source = max(
+            len(indexes) for indexes in self._source_indexes.values()
+        )
+
+    def __len__(self) -> int:
+        return self._samples_per_source * len(self._source_indexes)
+
+    def __iter__(self):
+        rng = np.random.default_rng(
+            (self.seed + self._epoch * 1_000_003) % (2**32)
+        )
+        self._epoch += 1
+        balanced: list[int] = []
+        for source in sorted(self._source_indexes):
+            indexes = np.asarray(self._source_indexes[source], dtype=np.int64)
+            selected: list[int] = []
+            while len(selected) < self._samples_per_source:
+                selected.extend(int(index) for index in rng.permutation(indexes))
+            balanced.extend(selected[: self._samples_per_source])
+        rng.shuffle(balanced)
+        return iter(balanced)
 
 
 def load_captions(path: str | Path) -> dict[str, str]:

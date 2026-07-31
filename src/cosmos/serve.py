@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -208,8 +209,15 @@ class CosmosRequestHandler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, FileNotFoundError) as error:
             self._respond(400, {"error": str(error)})
         except Exception as error:  # keep the server up when one request fails
-            LOGGER.exception("Generation failed")
-            self._respond(500, {"error": f"{type(error).__name__}: {error}"})
+            full_traceback = traceback.format_exc()
+            LOGGER.error("Generation failed\n%s", full_traceback)
+            self._respond(
+                500,
+                {
+                    "error": f"{type(error).__name__}: {error}",
+                    "traceback": full_traceback,
+                },
+            )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -237,6 +245,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     model.add_argument("--flow-shift", type=float, default=DEFAULT_FLOW_SHIFT)
     model.add_argument("--prompt", default=None, help="Default caption when a request omits one")
     model.add_argument("--no-warmup", action="store_true", help="Skip the throw-away first generation")
+    model.add_argument("--task", default="pick up can", help="Default task when a request omits one")
     return parser.parse_args(argv)
 
 
@@ -258,6 +267,7 @@ def main(argv: list[str] | None = None) -> None:
         guidance_scale=args.guidance_scale,
         flow_shift=args.flow_shift,
         prompt=args.prompt,
+        task=args.task,
     )
     if not args.no_warmup:
         runner.warmup()

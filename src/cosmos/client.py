@@ -84,7 +84,14 @@ class CosmosClient:
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")
             try:
-                detail = json.loads(detail).get("error", detail)
+                response = json.loads(detail)
+                message = response.get("error", detail)
+                remote_traceback = response.get("traceback")
+                detail = (
+                    f"{message}\n\nRemote Cosmos server traceback:\n{remote_traceback}"
+                    if remote_traceback
+                    else message
+                )
             except json.JSONDecodeError:
                 pass
             raise CosmosServerError(f"HTTP {error.code} from {self.url}{endpoint}: {detail}") from error
