@@ -437,11 +437,6 @@ class _PolicyDriver:
         self.action_mode = action_mode
         self._ik = None
         if action_mode == "eef_ik":
-            if info.action_repr != "absolute":
-                raise ValueError(
-                    "EEF IK mode requires an absolute-action checkpoint; "
-                    f"got action_repr={info.action_repr!r}."
-                )
             try:
                 from ui.piper_ik import PiperIK
             except ModuleNotFoundError as exc:
@@ -455,6 +450,23 @@ class _PolicyDriver:
     @property
     def plans(self) -> int:
         return self._plans
+
+    @property
+    def policy_state_keys(self) -> tuple[str, ...]:
+        return EEF_POLICY_ACTION_KEYS if self.action_mode == "eef_ik" else ACTION_KEYS
+
+    def policy_state(self, observation: Mapping[str, Any]) -> list[float]:
+        if self.action_mode == "joint":
+            return [float(observation[key]) for key in ACTION_KEYS]
+        try:
+            return [float(observation[key]) for key in EEF_POLICY_ACTION_KEYS]
+        except KeyError:
+            if self._ik is None:
+                raise RuntimeError("EEF IK was not initialised.")
+            joints = {key: float(observation[key]) for key in ACTION_KEYS}
+            pose = self._ik.forward_pose(joints)
+            pose["gripper.pos"] = float(observation["gripper.pos"])
+            return [float(pose[key]) for key in EEF_POLICY_ACTION_KEYS]
 
     @property
     def queued_actions(self) -> int:
@@ -517,17 +529,19 @@ class _PolicyDriver:
         self.info = replace(self.info, has_goal=bool(getattr(self.runner, "has_goal", False)))
 
     def act(
-        self, frame: Any, state: Any
+        self, frame: Any, state: Any, joint_state: Any | None = None
     ) -> tuple[dict[str, float], float | None]:
         """Next robot command, optionally converting an EEF target through IK."""
         if self.queued_actions:
             action = self.runner.action_dict(self.runner.select_action(frame, state))
-            return self._to_robot_action(action, state), None
+            return self._to_robot_action(action, joint_state if joint_state is not None else state), None
         started = time.perf_counter()
         action = self.runner.select_action(frame, state)
         elapsed = time.perf_counter() - started
         self._plans += 1
-        return self._to_robot_action(self.runner.action_dict(action), state), elapsed
+        return self._to_robot_action(
+            self.runner.action_dict(action), joint_state if joint_state is not None else state
+        ), elapsed
 
     def _to_robot_action(self, action: Mapping[str, float], state: Any) -> dict[str, float]:
         if self.action_mode == "joint":
@@ -768,8 +782,9 @@ class _PolicyControlWorker:
                         raise RuntimeError(
                             f"The robot observation carries no {CAMERA_KEY!r} camera frame."
                         )
-                    state = [float(observation[key]) for key in ACTION_KEYS]
-                    action, inference_s = driver.act(frame, state)
+                    state = driver.policy_state(observation)
+                    joint_state = [float(observation[key]) for key in ACTION_KEYS]
+                    action, inference_s = driver.act(frame, state, joint_state)
 
                     self._on_progress("robot.send_action")
                     send_started = time.perf_counter()

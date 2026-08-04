@@ -144,6 +144,9 @@ class PolicyConfig:
     action_repr: str = "absolute"
     delta_mode: str = "incremental"
     absolute_dims: list[int] = field(default_factory=list)
+    # Euler-angle action dimensions in degrees. Deltas on these dimensions are
+    # wrapped to [-180, 180] before normalization and after integration.
+    angular_dims: list[int] = field(default_factory=list)
 
     # --- normalisation ---
     # min-max maps targets into [-1, 1], which is what the sampler's clipping
@@ -156,6 +159,11 @@ class PolicyConfig:
 
     def __post_init__(self) -> None:
         self.down_dims = tuple(int(value) for value in self.down_dims)
+        self.angular_dims = [int(value) for value in self.angular_dims]
+        if len(set(self.angular_dims)) != len(self.angular_dims):
+            raise ValueError(f"angular_dims has duplicates: {self.angular_dims}")
+        if any(not 0 <= index < self.action_dim for index in self.angular_dims):
+            raise ValueError(f"angular_dims must be within [0, {self.action_dim})")
         if self.action_repr not in ACTION_REPRS:
             raise ValueError(f"action_repr must be one of {ACTION_REPRS}, got {self.action_repr!r}")
         if self.delta_mode not in DELTA_MODES:

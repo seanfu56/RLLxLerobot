@@ -332,6 +332,11 @@ def build_config(args: argparse.Namespace, bundle: Bundle, stats: dict) -> Polic
         action_repr=args.action_repr,
         delta_mode=args.delta_mode,
         absolute_dims=absolute_dims,
+        angular_dims=[
+            index
+            for index, name in enumerate(bundle.joint_names)
+            if name in {"eef.rx", "eef.ry", "eef.rz"}
+        ],
         state_norm=args.state_norm,
         action_norm=args.action_norm,
         clip_sample=args.clip_sample,

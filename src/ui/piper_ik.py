@@ -43,6 +43,24 @@ class PiperIK:
         self._fk = C_PiperForwardKinematics(dh_is_offset=dh_is_offset)
         self._least_squares = least_squares
 
+    def forward_pose(self, joints: Mapping[str, float]) -> dict[str, float]:
+        """Return the current EEF pose estimated from measured joint degrees."""
+        missing = [key for key in JOINT_KEYS if key not in joints]
+        if missing:
+            raise ValueError(f"Cannot compute EEF state; missing joints: {', '.join(missing)}")
+        joints_rad = [math.radians(float(joints[key])) for key in JOINT_KEYS]
+        pose = self._fk.CalFK(joints_rad)[-1]
+        return {
+            **{
+                key: float(value) / 1000.0
+                for key, value in zip(EEF_POSE_KEYS[:3], pose[:3], strict=True)
+            },
+            **{
+                key: float(value)
+                for key, value in zip(EEF_POSE_KEYS[3:], pose[3:], strict=True)
+            },
+        }
+
     def solve(
         self,
         target: Mapping[str, float],

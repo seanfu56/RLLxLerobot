@@ -23,6 +23,7 @@ from .backbones import ImageNormalizer, SpatialSoftmax, replace_batchnorm_with_g
 from .config import PolicyConfig, target_stats
 from .modules import Normalizer, sinusoidal_embedding
 from .objectives import build_objective
+from .angles import wrap_torch
 
 
 class RgbEncoder(nn.Module):
@@ -364,7 +365,9 @@ class ChunkPolicy(nn.Module):
         return previous * self.delta_mask
 
     def _target_actions(self, batch: dict[str, Tensor]) -> Tensor:
-        return self.action_normalizer.normalize(batch["action"] - self._reference(batch))
+        delta = batch["action"] - self._reference(batch)
+        delta = wrap_torch(delta, tuple(self.config.angular_dims))
+        return self.action_normalizer.normalize(delta)
 
     def _to_absolute(self, actions: Tensor, batch: dict[str, Tensor]) -> Tensor:
         """Invert the target transform; needs no ground truth, unlike ``_reference``."""
@@ -374,6 +377,7 @@ class ChunkPolicy(nn.Module):
             relative = state + predicted.cumsum(dim=1)
         else:
             relative = state + predicted
+        relative = wrap_torch(relative, tuple(self.config.angular_dims))
         return self.delta_mask * relative + (1 - self.delta_mask) * predicted
 
     # ------------------------------------------------------------------

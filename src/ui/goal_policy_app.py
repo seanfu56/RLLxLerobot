@@ -315,7 +315,8 @@ def checkpoint_panel() -> PolicySettings | None:
         help=(
             "EEF IK requires a checkpoint trained with action columns "
             "eef.x/eef.y/eef.z/eef.rx/eef.ry/eef.rz/gripper.pos. "
-            "Existing joint-target checkpoints must use Joint targets."
+            "Both absolute and delta EEF checkpoints are supported. Existing "
+            "joint-target checkpoints must use Joint targets."
         ),
     )
 
@@ -1060,6 +1061,20 @@ def rollout_panel() -> None:
                 st.error(f"Could not park the arm: {exc}")
     elif current.state is PolicyState.DISCONNECTED:
         st.info("Connect the hardware to run the policy.")
+    elif current.state is PolicyState.ERROR:
+        # A failed worker latches the runtime in ERROR and ends the episode. The
+        # reason used to be shown only in the telemetry panel at the bottom of
+        # the page, which is not where the operator is looking when a rollout
+        # stops three steps in.
+        st.error(
+            f"The rollout was stopped by the {current.error_source or 'runtime'}: "
+            f"{current.last_error or 'no message was recorded'}",
+            icon="🚨",
+        )
+        st.caption(
+            "The arm is no longer commanded. This message stays until the hardware is "
+            "reconnected: use Safe disconnect, then Connect, before starting another rollout."
+        )
     else:
         st.info(f"Runtime is {current.state.value}.")
 

@@ -899,6 +899,18 @@ def rollout_panel() -> None:
                 st.error(f"Could not park the arm: {exc}")
     elif current.state is PolicyState.DISCONNECTED:
         st.info("Connect the hardware to run the policy.")
+    elif current.state is PolicyState.ERROR:
+        # The reason a rollout stopped belongs next to the rollout, not only in
+        # the telemetry panel at the bottom of the page.
+        st.error(
+            f"The rollout was stopped by the {current.error_source or 'runtime'}: "
+            f"{current.last_error or 'no message was recorded'}",
+            icon="🚨",
+        )
+        st.caption(
+            "The arm is no longer commanded. This message stays until the hardware is "
+            "reconnected: use Safe disconnect, then Connect, before starting another rollout."
+        )
     else:
         st.info(f"Runtime is {current.state.value}.")
 

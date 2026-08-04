@@ -56,6 +56,15 @@ class PolicyRunner:
         payload = torch.load(self.checkpoint_path, map_location="cpu", weights_only=False)
         self.config = PolicyConfig.from_dict(payload["config"])
         self.joint_names: list[str] = list(payload.get("joint_names", []))
+        # Older EEF checkpoints predate angular_dims in PolicyConfig. Infer the
+        # dimensions from their action names so their reconstructed rotations
+        # are still kept in the canonical Euler range.
+        if not self.config.angular_dims:
+            self.config.angular_dims = [
+                index
+                for index, name in enumerate(self.joint_names)
+                if name in {"eef.rx", "eef.ry", "eef.rz"}
+            ]
         self.fps: float = float(payload.get("fps", 20.0))
         self.step: int | None = payload.get("step")
         self.use_ema = bool(use_ema and payload.get("ema"))

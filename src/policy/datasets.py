@@ -17,6 +17,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .angles import wrap_numpy
+
 ACTION_REPRS = ("absolute", "delta")
 
 
@@ -255,7 +257,12 @@ def default_drop_n_last_frames(horizon: int, n_action_steps: int, n_obs_steps: i
     return max(0, horizon - n_action_steps - n_obs_steps + 1)
 
 
-def compute_stats(bundle: Bundle, episodes: list[EpisodeRef], chunk_size: int) -> dict[str, dict[str, list[float]]]:
+def compute_stats(
+    bundle: Bundle,
+    episodes: list[EpisodeRef],
+    chunk_size: int,
+    angular_dims: tuple[int, ...] | None = None,
+) -> dict[str, dict[str, list[float]]]:
     """Normalisation statistics over the training episodes only.
 
     Both delta conventions are described, because they have very different scales:
@@ -268,6 +275,11 @@ def compute_stats(bundle: Bundle, episodes: list[EpisodeRef], chunk_size: int) -
     actions: list[np.ndarray] = []
     deltas: list[np.ndarray] = []
     increments: list[np.ndarray] = []
+    if angular_dims is None:
+        angular_dims = tuple(
+            index for index, name in enumerate(bundle.joint_names)
+            if name in {"eef.rx", "eef.ry", "eef.rz"}
+        )
     for episode in episodes:
         state = bundle.states[episode.shard][episode.start : episode.end]
         action = bundle.actions[episode.shard][episode.start : episode.end]
@@ -276,9 +288,13 @@ def compute_stats(bundle: Bundle, episodes: list[EpisodeRef], chunk_size: int) -
         length = len(state)
         offsets = np.minimum(np.arange(length)[:, None] + np.arange(chunk_size)[None, :], length - 1)
         chunk_actions = action[offsets]  # (length, chunk_size, dim)
-        deltas.append((chunk_actions - state[:, None, :]).reshape(-1, state.shape[1]))
+        deltas.append(
+            wrap_numpy(chunk_actions - state[:, None, :], angular_dims).reshape(-1, state.shape[1])
+        )
         previous = np.concatenate([state[:, None, :], chunk_actions[:, :-1, :]], axis=1)
-        increments.append((chunk_actions - previous).reshape(-1, state.shape[1]))
+        increments.append(
+            wrap_numpy(chunk_actions - previous, angular_dims).reshape(-1, state.shape[1])
+        )
 
     def describe(values: np.ndarray) -> dict[str, list[float]]:
         return {
