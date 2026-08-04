@@ -54,6 +54,13 @@ class PiperFollower(Robot):
             f"{name}.pos": float for name in JOINT_NAMES
         }
         features["gripper.pos"] = float
+        # Cartesian feedback from the Piper controller, in metres.
+        features.update(
+            {
+                name: float
+                for name in ("eef.x", "eef.y", "eef.z", "eef.rx", "eef.ry", "eef.rz")
+            }
+        )
         for cam_name in self.cameras:
             cam_cfg = self.config.cameras[cam_name]
             features[cam_name] = (cam_cfg.height, cam_cfg.width, 3)
@@ -171,6 +178,10 @@ class PiperFollower(Robot):
         j6 = js.joint_6 / 1000.0
         grip = gripper_msgs.gripper_state.grippers_angle / 1000.0
 
+        # Piper SDK reports end-pose XYZ in 0.001 mm.  Convert to metres so
+        # the recorded observation has an unambiguous SI unit.
+        end_pose = self.piper.GetArmEndPoseMsgs().end_pose
+
         if self.config.unit == "rad":
             j1 = math.radians(j1)
             j2 = math.radians(j2)
@@ -188,6 +199,12 @@ class PiperFollower(Robot):
             "joint_5.pos": j5,
             "joint_6.pos": j6,
             "gripper.pos": grip,
+            "eef.x": end_pose.X_axis / 1_000_000.0,
+            "eef.y": end_pose.Y_axis / 1_000_000.0,
+            "eef.z": end_pose.Z_axis / 1_000_000.0,
+            "eef.rx": end_pose.RX_axis / 1000.0,
+            "eef.ry": end_pose.RY_axis / 1000.0,
+            "eef.rz": end_pose.RZ_axis / 1000.0,
         }
 
         for cam_key, cam in self.cameras.items():
