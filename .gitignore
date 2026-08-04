@@ -1,7 +1,8 @@
 # === Upstream repos (cloned, not our code) ===
 lerobot/
 ros2_ws/
-
+snapshots/
+sweeps
 models/
 piper-data/
 plugins/lerobot_omy_piper_retarget
