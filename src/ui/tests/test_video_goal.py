@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,6 +80,76 @@ class GoalVideoTests(unittest.TestCase):
     def test_asking_for_a_frame_that_is_not_there_is_an_error(self) -> None:
         with self.assertRaises(IndexError):
             fake_video(4).frame(9)
+
+
+class GoalVideoSaveTests(unittest.TestCase):
+    """Keeping the video: without it nothing records what the policy aimed at."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name) / "goal_video"
+
+    def test_every_frame_is_written_with_a_readable_meta(self) -> None:
+        video = fake_video(4)
+        written = video.save(self.directory)
+        self.assertEqual(written, self.directory)
+        self.assertEqual(len(sorted(written.glob("frame_*.png"))), 4)
+        meta = json.loads((written / "meta.json").read_text())
+        self.assertEqual(meta["frame_count"], 4)
+        self.assertEqual(meta["goal_index"], 2)
+        self.assertEqual(meta["source"], "unit test")
+
+    def test_the_frames_are_the_generated_bytes_not_a_re_encode(self) -> None:
+        video = fake_video(4)
+        written = video.save(self.directory)
+        self.assertEqual((written / "frame_002.png").read_bytes(), video.frames_png[2])
+
+    def test_the_aimed_frame_is_copied_out_as_the_goal(self) -> None:
+        """The operator can override the default, so goal.png is not frame 2."""
+        written = fake_video(4).save(self.directory, chosen_index=1)
+        goal = cv2.imread(str(written / "goal.png"))
+        np.testing.assert_array_equal(goal, fake_video(4).frame(1))
+        meta = json.loads((written / "meta.json").read_text())
+        self.assertEqual(meta["goal_index"], 1)
+        self.assertEqual(meta["default_goal_index"], 2)
+
+    def test_a_goal_outside_the_video_is_an_error(self) -> None:
+        with self.assertRaises(IndexError):
+            fake_video(4).save(self.directory, chosen_index=9)
+
+    def test_extra_fields_land_in_the_meta(self) -> None:
+        written = fake_video(4).save(self.directory, extra={"episode": "episode_007"})
+        self.assertEqual(json.loads((written / "meta.json").read_text())["episode"], "episode_007")
+
+    def test_a_playable_clip_is_written_beside_the_frames(self) -> None:
+        written = fake_video(6).save(self.directory)
+        name = json.loads((written / "meta.json").read_text())["clip"]
+        self.assertIsNotNone(name)
+        capture = cv2.VideoCapture(str(written / name))
+        try:
+            frames = 0
+            while capture.read()[0]:
+                frames += 1
+        finally:
+            capture.release()
+        self.assertEqual(frames, 6)
+
+    def test_a_clip_that_cannot_be_written_does_not_lose_the_frames(self) -> None:
+        """The PNGs are the archive; the clip is only there to be watched."""
+        video = GoalVideo(
+            frames_png=(
+                encode_png(np.zeros((8, 8, 3), np.uint8)),
+                encode_png(np.zeros((16, 16, 3), np.uint8)),
+            ),
+            goal_index=0,
+            source="mixed sizes",
+            seconds=0.01,
+            fps=1.0,
+        )
+        written = video.save(self.directory)
+        self.assertEqual(len(sorted(written.glob("frame_*.png"))), 2)
+        self.assertIsNone(json.loads((written / "meta.json").read_text())["clip"])
 
 
 class VideoSourceConfigTests(unittest.TestCase):

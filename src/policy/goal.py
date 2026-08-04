@@ -57,6 +57,15 @@ constant for a whole rollout: a cached feature is one more thing that can go
 stale, and the failure mode - the arm driving confidently towards a goal the
 operator has already replaced - is worse than the few milliseconds it saves.
 
+**Turning the goal up.** ``--goal-dropout`` also buys goal-only classifier-free
+guidance: with a trained ``null_goal`` the sampler can run a second branch that
+sees this same frame and this same joint state but no goal, and extrapolate away
+from it. The weight then scales the goal's influence and nothing else, which is
+the knob a goal-conditioned rollout wants - unlike ``--cond-dropout`` guidance,
+which blanks the observation too and sharpens everything at once. Select it with
+``--guidance-mode goal`` (``GoalChunkPolicy.guidance_context``); no retraining is
+needed for a run that already has goal dropout.
+
 Layout: the dataset draws the goal frame, the policy encodes it, the runner
 holds one for the whole rollout.
 
@@ -249,12 +258,14 @@ class GoalChunkPolicy(ChunkPolicy):
     distribution - the goal frame is simply a frame of the episode.
 
     ``goal_dropout`` swaps the goal feature for a learned null embedding on that
-    fraction of training samples. Two things follow: the checkpoint can be run
+    fraction of training samples. Three things follow: the checkpoint can be run
     with no goal at all, which is both a fallback and the honest way to measure
-    what the goal is contributing, and the goal is never so load-bearing that a
-    slightly wrong one derails the chunk. It is orthogonal to ``cond_dropout``,
-    which drops the *whole* conditioning vector, goal included, and is what
-    classifier-free guidance needs.
+    what the goal is contributing; the goal is never so load-bearing that a
+    slightly wrong one derails the chunk; and ``null_goal`` becomes a trained
+    branch to guide away from, which is what ``guidance_mode="goal"`` uses (see
+    ``guidance_context``). It is orthogonal to ``cond_dropout``, which drops the
+    *whole* conditioning vector, goal included - the branch ``guidance_mode=
+    "full"`` needs.
     """
 
     def __init__(self, config: PolicyConfig):
@@ -295,6 +306,63 @@ class GoalChunkPolicy(ChunkPolicy):
         # the observation has to drop the goal with it, or the "unconditional"
         # branch would still know where the episode ends.
         return self.apply_cond_dropout(torch.cat([observation, goal], dim=-1))
+
+    def guidance_context(self, context: Tensor, mode: str) -> Tensor:
+        """Goal-only guidance: the same observation, with the goal taken away.
+
+        Under ``mode="full"`` the guided branch is the inherited "no observation
+        at all" embedding, and guidance sharpens everything at once - where the
+        arm is, what the camera sees, and where the episode is going.
+
+        Under ``mode="goal"`` only the goal half of the vector is replaced, by
+        the same ``null_goal`` the model was trained to read when a sample's goal
+        was dropped. The difference between the two branches is then exactly
+        "with this goal" minus "from this frame, no goal in particular", so the
+        weight scales the goal's influence and nothing else: the policy keeps
+        full sight of the scene it has to act in while being pushed harder
+        towards the picture it was aimed at.
+
+        The split is a slice rather than a re-encode. ``encode_context``
+        concatenates [observation, goal] in that order and ``_global_cond_dim``
+        widens the vector by exactly one encoder feature for the goal, so the
+        goal is the tail - and rebuilding it this way costs no second pass
+        through the ResNet.
+        """
+        if mode != "goal":
+            return super().guidance_context(context, mode)
+        if self.config.goal_dropout <= 0.0:
+            # Reachable only by calling the model directly; predict() checks the
+            # config first. Refuse anyway: null_goal is otherwise noise.
+            raise ValueError(
+                f"{type(self).__name__} was trained with goal_dropout=0, so null_goal is "
+                "untrained and goal-only guidance would extrapolate from noise."
+            )
+        width = self.rgb_encoder.feature_dim
+        null_goal = self.null_goal.to(context.dtype).expand(context.shape[0], -1)
+        return torch.cat([context[:, :-width], null_goal], dim=-1)
+
+    @torch.no_grad()
+    def predict(
+        self,
+        batch: dict[str, Tensor],
+        guidance_weight: float | None = None,
+        guidance_mode: str | None = None,
+    ) -> Tensor:
+        """As ``ChunkPolicy.predict``, but goal-only guidance needs a goal.
+
+        Without one the conditional branch is already the null-goal branch, the
+        two sides of the extrapolation are identical, and the weight silently
+        does nothing - which looks like guidance that has no effect rather than
+        guidance that was never applied.
+        """
+        weight = self.config.guidance_weight if guidance_weight is None else float(guidance_weight)
+        mode = self.config.guidance_mode if guidance_mode is None else str(guidance_mode)
+        if weight != 1.0 and mode == "goal" and batch.get("goal_image") is None:
+            raise ValueError(
+                "Goal-only guidance needs a goal frame: with none, both branches are the null "
+                "goal and the weight would have no effect. Set a goal, or guide in 'full' mode."
+            )
+        return super().predict(batch, guidance_weight=guidance_weight, guidance_mode=guidance_mode)
 
 
 class GoalPolicyRunner(PolicyRunner):

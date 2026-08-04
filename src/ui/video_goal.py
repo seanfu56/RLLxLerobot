@@ -29,10 +29,17 @@ this is the default, not a rule.
 Frames cross every boundary here as PNG bytes. The runtime lives in a separate
 process from Streamlit, so whatever comes back has to pickle cheaply, and PNG is
 also what an ``st.image`` and an ``<img>`` tag both accept without conversion.
+
+**Keeping the video.** ``GoalVideo.save`` writes one to disk. A generated video
+is the only record of what the policy was told to do - a rollout that fails
+because the goal was wrong and one that fails because the policy is wrong look
+identical in the episode's video - and it is not reproducible from the
+checkpoint, since the sampler runs unseeded unless the operator fixes it.
 """
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,8 +50,8 @@ import numpy as np
 
 VIDEO_SOURCES = ("cosmos", "diffusion")
 DEFAULT_COSMOS_URL = "http://127.0.0.1:8501"
-DEFAULT_BASE_CHECKPOINT = Path("models/video_diffusion/pick-can-all/base/best.pt")
-DEFAULT_SUPERRES_CHECKPOINT = Path("models/video_diffusion/pick-can-all/superres/best.pt")
+DEFAULT_BASE_CHECKPOINT = Path("models/video_diffusion/pick-can-all/base/latest.pt")
+DEFAULT_SUPERRES_CHECKPOINT = Path("models/video_diffusion/pick-can-all-sr/latest.pt")
 
 __all__ = [
     "DEFAULT_BASE_CHECKPOINT",
@@ -139,6 +146,51 @@ class GoalVideo:
             raise ValueError(f"Goal video frame {index} could not be decoded")
         return decoded
 
+    def save(
+        self,
+        directory: str | Path,
+        *,
+        chosen_index: int | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> Path:
+        """Write the video to ``directory``: frames, a playable clip, and meta.json.
+
+        The frames are written as the PNG bytes that were generated, not
+        re-encoded, so what lands on disk is bit-for-bit the picture the policy
+        was aimed at. The clip beside them is for watching, and is allowed to be
+        missing: ``meta.json`` names it, or records null when this OpenCV build
+        could not write one.
+
+        ``chosen_index`` is the frame the operator actually aimed at, which is
+        not always the default one, and is copied out to ``goal.png`` so the
+        goal of an episode can be seen without knowing the sampling rule.
+        """
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        for index, payload in enumerate(self.frames_png):
+            (directory / f"frame_{index:03d}.png").write_bytes(payload)
+        if chosen_index is not None:
+            if not 0 <= chosen_index < self.frame_count:
+                raise IndexError(
+                    f"chosen_index {chosen_index} is outside [0, {self.frame_count})"
+                )
+            (directory / "goal.png").write_bytes(self.frames_png[chosen_index])
+
+        meta = {
+            "source": self.source,
+            "frame_count": self.frame_count,
+            "fps": self.fps,
+            "generation_seconds": round(self.seconds, 3),
+            "default_goal_index": self.goal_index,
+            "goal_index": self.goal_index if chosen_index is None else int(chosen_index),
+            "clip": _write_clip(directory, self, self.fps),
+            "frames": "frame_NNN.png, in generated order; frame 0 is the camera frame "
+            "the model was conditioned on",
+            **(extra or {}),
+        }
+        (directory / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        return directory
+
 
 def default_goal_index(frame_count: int) -> int:
     """The third of four frames sampled evenly - the rule training used.
@@ -167,6 +219,37 @@ def encode_png(frame_bgr: np.ndarray) -> bytes:
     if not ok:
         raise RuntimeError("cv2.imencode failed to encode a PNG")
     return buffer.tobytes()
+
+
+def _write_clip(directory: Path, video: GoalVideo, fps: float) -> str | None:
+    """A watchable version of the frames next to them; None if none could be written.
+
+    Best effort on purpose. The PNGs are the archive - they are lossless and
+    already written by the time this runs - and an OpenCV build without the mp4
+    encoder is not a reason to fail a save that has otherwise succeeded. MJPG in
+    an AVI container is the fallback because it is the encoder the recording
+    workers in ``teleop_runtime`` already rely on.
+    """
+    frames = [video.frame(index) for index in range(video.frame_count)]
+    height, width = frames[0].shape[:2]
+    if any(frame.shape[:2] != (height, width) for frame in frames):
+        return None  # a mixed-size clip would be silently truncated by the writer
+    for name, fourcc in (("video.mp4", "mp4v"), ("video.avi", "MJPG")):
+        path = directory / name
+        writer = cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*fourcc), max(float(fps), 1.0), (width, height)
+        )
+        if not writer.isOpened():
+            writer.release()
+            path.unlink(missing_ok=True)
+            continue
+        try:
+            for frame in frames:
+                writer.write(frame)
+        finally:
+            writer.release()
+        return name
+    return None
 
 
 # ---------------------------------------------------------------------------

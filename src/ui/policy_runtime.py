@@ -84,6 +84,7 @@ except ModuleNotFoundError as exc:  # running with src/ui itself on sys.path
 DEFAULT_PREVIEW_PATH = DEFAULT_STATIC_PATH.with_name("policy_live.jpg")
 DEFAULT_MODEL_ROOT = Path("models/sweeps")
 DEFAULT_OUTPUT_DIR = Path("outputs/policy_eval")
+EEF_POLICY_ACTION_KEYS = ("eef.x", "eef.y", "eef.z", "eef.rx", "eef.ry", "eef.rz", "gripper.pos")
 
 # What an operator can say about a finished rollout. The label is the whole
 # point of running evaluation episodes: it is the success rate, and it is the
@@ -112,9 +113,15 @@ class PolicySettings:
     # Classifier-free guidance. None keeps whatever the checkpoint was trained
     # with; 1.0 is plain conditional sampling.
     guidance_weight: float | None = None
+    # Which conditioning the guided branch drops - "full" or "goal"; see
+    # policy.config.GUIDANCE_MODES. None keeps the checkpoint's own default.
+    guidance_mode: str | None = None
     # Goal frame for a --goal-conditioned checkpoint. Read in the hardware
     # process, so this is a path rather than an array.
     goal_image: Path | None = None
+    # ``joint`` preserves existing checkpoints. ``eef_ik`` interprets policy
+    # actions as Cartesian pose targets and solves them to Piper joint targets.
+    action_mode: str = "joint"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checkpoint", Path(self.checkpoint).expanduser())
@@ -132,6 +139,8 @@ class PolicySettings:
             raise ValueError("guidance_weight must not be negative.")
         if not self.device:
             raise ValueError("Device must not be empty.")
+        if self.action_mode not in {"joint", "eef_ik"}:
+            raise ValueError("action_mode must be 'joint' or 'eef_ik'.")
 
 
 @dataclass(frozen=True)
@@ -162,8 +171,12 @@ class PolicyInfo:
     n_obs_steps: int = 1
     down_dims: tuple[int, ...] = ()
     guidance_weight: float = 1.0
-    # True only when the checkpoint was trained with conditioning dropout, i.e.
-    # when it actually has an unconditional branch to guide away from.
+    # What the guided branch drops, and which modes this checkpoint trained the
+    # null embedding for: "full" needs cond_dropout, "goal" needs goal_dropout.
+    guidance_mode: str = "full"
+    guidance_modes: tuple[str, ...] = ()
+    # True only when guidance is usable in the mode now selected, i.e. when the
+    # null embedding that mode guides away from was actually trained.
     supports_guidance: bool = False
     # Goal conditioning (see src/policy/goal.py). ``has_goal`` is False when a
     # goal-conditioned checkpoint is running against its learned null embedding,
@@ -176,7 +189,11 @@ class PolicyInfo:
         # steps for flow matching.
         sampler = f"{self.num_inference_steps} sampler steps"
         observing = f", observing {self.n_obs_steps}" if self.n_obs_steps > 1 else ""
-        guided = f" · guidance {self.guidance_weight:g}" if self.guidance_weight != 1.0 else ""
+        guided = (
+            f" · guidance {self.guidance_weight:g} ({self.guidance_mode})"
+            if self.guidance_weight != 1.0
+            else ""
+        )
         goal = ""
         if self.goal_conditioned:
             goal = " · goal set" if self.has_goal else " · no goal (null embedding)"
@@ -414,9 +431,25 @@ def _default_hardware_factory(config: PolicyRuntimeConfig) -> PolicyHardwareBund
 class _PolicyDriver:
     """Adapts ``PolicyRunner`` to the control loop and counts its work."""
 
-    def __init__(self, runner: Any, info: PolicyInfo) -> None:
+    def __init__(self, runner: Any, info: PolicyInfo, *, action_mode: str = "joint") -> None:
         self.runner = runner
         self.info = info
+        self.action_mode = action_mode
+        self._ik = None
+        if action_mode == "eef_ik":
+            if info.action_repr != "absolute":
+                raise ValueError(
+                    "EEF IK mode requires an absolute-action checkpoint; "
+                    f"got action_repr={info.action_repr!r}."
+                )
+            try:
+                from ui.piper_ik import PiperIK
+            except ModuleNotFoundError as exc:
+                if exc.name != "ui":
+                    raise
+                from piper_ik import PiperIK
+
+            self._ik = PiperIK()
         self._plans = 0
 
     @property
@@ -439,11 +472,32 @@ class _PolicyDriver:
         setter = getattr(self.runner, "set_guidance_weight", None)
         if setter is None or not self.info.supports_guidance:
             raise RuntimeError(
-                f"{self.info.run_name} has no unconditional branch; it was trained without "
-                "conditioning dropout, so classifier-free guidance is not available."
+                f"{self.info.run_name} has no branch to guide away from in mode "
+                f"{self.info.guidance_mode!r}, so classifier-free guidance is not available."
             )
         setter(weight)
         self.info = replace(self.info, guidance_weight=float(weight))
+
+    def set_guidance_mode(self, mode: str) -> None:
+        """Change what the guided branch drops, without reloading the weights.
+
+        The runner drops its queued chunk here too: a chunk planned under full
+        guidance is not what the goal-only branch would have produced.
+        """
+        setter = getattr(self.runner, "set_guidance_mode", None)
+        if setter is None:
+            raise RuntimeError(f"{self.info.run_name} does not support guidance modes.")
+        if mode not in self.info.guidance_modes and self.info.guidance_weight != 1.0:
+            raise RuntimeError(
+                f"{self.info.run_name} cannot be guided in mode {mode!r}: it trained no null "
+                f"embedding for it. Available: {', '.join(self.info.guidance_modes) or 'none'}."
+            )
+        setter(mode)
+        self.info = replace(
+            self.info,
+            guidance_mode=str(mode),
+            supports_guidance=mode in self.info.guidance_modes,
+        )
 
     def set_goal(self, frame_bgr: Any | None) -> None:
         """Point the policy at a goal frame, or take its goal away.
@@ -465,14 +519,28 @@ class _PolicyDriver:
     def act(
         self, frame: Any, state: Any
     ) -> tuple[dict[str, float], float | None]:
-        """Next joint command, and the sampler latency when it re-planned."""
+        """Next robot command, optionally converting an EEF target through IK."""
         if self.queued_actions:
-            return self.runner.action_dict(self.runner.select_action(frame, state)), None
+            action = self.runner.action_dict(self.runner.select_action(frame, state))
+            return self._to_robot_action(action, state), None
         started = time.perf_counter()
         action = self.runner.select_action(frame, state)
         elapsed = time.perf_counter() - started
         self._plans += 1
-        return self.runner.action_dict(action), elapsed
+        return self._to_robot_action(self.runner.action_dict(action), state), elapsed
+
+    def _to_robot_action(self, action: Mapping[str, float], state: Any) -> dict[str, float]:
+        if self.action_mode == "joint":
+            return dict(action)
+        if set(EEF_POLICY_ACTION_KEYS) - set(action):
+            raise ValueError(
+                "EEF IK mode requires a checkpoint with action names "
+                f"{EEF_POLICY_ACTION_KEYS}; got {tuple(action)}"
+            )
+        if self._ik is None:
+            raise RuntimeError("EEF IK was not initialised.")
+        seed = dict(zip(ACTION_KEYS, state, strict=True))
+        return self._ik.solve(action, seed)
 
 
 def _read_goal_image(path: Path) -> Any:
@@ -509,6 +577,7 @@ def _build_runner(settings: PolicySettings) -> Any:
         action_steps=settings.action_steps,
         num_inference_steps=settings.num_inference_steps,
         guidance_weight=settings.guidance_weight,
+        guidance_mode=settings.guidance_mode,
         **extra,
     )
 
@@ -541,11 +610,20 @@ def _default_policy_factory(settings: PolicySettings) -> _PolicyDriver:
         n_obs_steps=int(description.get("n_obs_steps", 1)),
         down_dims=tuple(description.get("down_dims") or ()),
         guidance_weight=float(description.get("guidance_weight", 1.0)),
-        supports_guidance=float(description.get("cond_dropout") or 0.0) > 0.0,
+        guidance_mode=str(description.get("guidance_mode", "full")),
+        guidance_modes=tuple(description.get("guidance_modes") or ()),
+        # The runner decides: the rule depends on the mode, and restating it
+        # here is how the UI would end up offering guidance a checkpoint cannot
+        # actually do. Older runners only reported cond_dropout.
+        supports_guidance=bool(
+            description.get(
+                "supports_guidance", float(description.get("cond_dropout") or 0.0) > 0.0
+            )
+        ),
         goal_conditioned=bool(description.get("goal_conditioned", False)),
         has_goal=bool(description.get("has_goal", False)),
     )
-    return _PolicyDriver(runner, info)
+    return _PolicyDriver(runner, info, action_mode=settings.action_mode)
 
 
 @dataclass
@@ -1329,6 +1407,22 @@ class PolicyRuntime:
             driver.set_guidance_weight(float(weight))
             return self.get_snapshot()
 
+    def set_guidance_mode(self, mode: str) -> PolicySnapshot:
+        """Change what the guided branch drops, between rollouts.
+
+        Refused while driving for the same reason as the weight: it changes what
+        the policy commands, and a rollout has to be attributable to one of them.
+        """
+        with self._command_lock:
+            with self._lock:
+                if self._state is PolicyState.RUNNING:
+                    raise RuntimeError("Stop the rollout before changing the guidance mode.")
+                driver = self._driver
+            if driver is None:
+                raise RuntimeError("Load a checkpoint before setting a guidance mode.")
+            driver.set_guidance_mode(str(mode))
+            return self.get_snapshot()
+
     # ------------------------------------------------------------------
     # goal conditioning
     # ------------------------------------------------------------------
@@ -1785,6 +1879,7 @@ def _policy_meta(policy: PolicyInfo | None) -> dict[str, Any] | None:
         # episode has to say which weight actually produced it.
         "n_obs_steps": policy.n_obs_steps,
         "guidance_weight": policy.guidance_weight,
+        "guidance_mode": policy.guidance_mode,
     }
 
 
@@ -1807,6 +1902,7 @@ _PROCESS_OPERATIONS = frozenset(
         "return_to_start",
         "set_preview_enabled",
         "set_guidance_weight",
+        "set_guidance_mode",
         "generate_goal_video",
         "set_goal_frame",
         "get_snapshot",
@@ -1943,6 +2039,9 @@ class ProcessPolicyRuntime:
 
     def set_guidance_weight(self, weight: float) -> PolicySnapshot:
         return self._snapshot_rpc("set_guidance_weight", weight, timeout_s=10.0)
+
+    def set_guidance_mode(self, mode: str) -> PolicySnapshot:
+        return self._snapshot_rpc("set_guidance_mode", mode, timeout_s=10.0)
 
     # Generation is the slow half of a goal-conditioned rollout: a 93-frame
     # Cosmos clip is seconds of transformer, and the first call also pays for

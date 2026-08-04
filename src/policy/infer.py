@@ -39,6 +39,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from policy.config import GUIDANCE_MODES  # noqa: E402
 from policy.datasets import Bundle  # noqa: E402
 from policy.goal import load_runner  # noqa: E402
 from policy.inference import PolicyRunner  # noqa: E402
@@ -59,6 +60,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Classifier-free guidance weight(s). 1.0 is plain conditional sampling. "
                              "Several values replay the episode once per weight and rank them, which "
                              "is how to pick one without touching the arm")
+    parser.add_argument("--guidance-mode", choices=GUIDANCE_MODES, default=None,
+                        help="What the guided branch drops: full (the whole conditioning vector) "
+                             "or goal (only the goal frame, keeping the observation, so the weight "
+                             "scales the goal alone). Default: the checkpoint's own")
 
     goal = parser.add_argument_group("goal conditioning")
     goal.add_argument("--goal-image", type=Path, default=None, metavar="PATH",
@@ -211,6 +216,7 @@ def main(argv: list[str] | None = None) -> None:
         action_steps=args.action_steps,
         num_inference_steps=args.num_inference_steps,
         guidance_weight=weights[0] if weights else None,
+        guidance_mode=args.guidance_mode,
     )
     goal_conditioned = runner.config.goal_conditioned
     if args.goal_image is not None and not goal_conditioned:
@@ -233,9 +239,9 @@ def main(argv: list[str] | None = None) -> None:
           f"{description['num_inference_steps']} sampler steps")
     print(f"unet         {tuple(description['down_dims'])} | device {description['device']} | "
           f"ema {description['use_ema']}")
-    print(f"guidance     weight {description['guidance_weight']} "
-          f"(trained with cond dropout {description['cond_dropout']})"
-          + ("" if runner.supports_guidance else " - guidance unavailable"))
+    print(f"guidance     weight {description['guidance_weight']} · mode {description['guidance_mode']} "
+          f"(cond dropout {description['cond_dropout']}, goal dropout {description['goal_dropout']})"
+          + ("" if runner.supports_guidance else " - guidance unavailable in this mode"))
     print(f"action       {description['action_repr']}"
           + (f"/{description['delta_mode']}" if description["action_repr"] == "delta" else ""))
 

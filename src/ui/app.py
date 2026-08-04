@@ -14,6 +14,7 @@ try:
     from ui.recording_control import RecordingCommandController
     from ui.teleop_runtime import (
         ACTION_KEYS,
+        EEF_POSE_KEYS,
         DEFAULT_STATIC_PATH,
         CameraSettings,
         RecordingConfig,
@@ -27,6 +28,7 @@ except ModuleNotFoundError as exc:
     from recording_control import RecordingCommandController
     from teleop_runtime import (
         ACTION_KEYS,
+        EEF_POSE_KEYS,
         DEFAULT_STATIC_PATH,
         CameraSettings,
         RecordingConfig,
@@ -515,6 +517,18 @@ def telemetry_panel() -> None:
             }
         )
     st.dataframe(joint_rows, hide_index=True, width="stretch")
+    eef = snapshot.latest_observation
+    eef_pose = [
+        {
+            "Axis": axis.upper(),
+            "Value": eef.get(key),
+            "Unit": "m" if axis in ("x", "y", "z") else "deg",
+        }
+        for axis, key in zip(
+            ("x", "y", "z", "rx", "ry", "rz"), EEF_POSE_KEYS, strict=True
+        )
+    ]
+    st.dataframe(eef_pose, hide_index=True, width="stretch")
     st.caption(
         f"minimum rolling effective rate {snapshot.minimum_effective_hz:.1f} Hz · "
         f"control stage {snapshot.control_stage} ({_format_age(snapshot.control_stage_age_s)}) · "

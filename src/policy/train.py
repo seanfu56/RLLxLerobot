@@ -41,7 +41,8 @@ if __package__ in (None, ""):
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from policy.config import (
-        ACTION_REPRS, DELTA_MODES, FLOW_TIME_SAMPLINGS, GOAL_SELECTIONS, OBJECTIVES, PolicyConfig,
+        ACTION_REPRS, DELTA_MODES, FLOW_TIME_SAMPLINGS, GOAL_SELECTIONS, GUIDANCE_MODES,
+        OBJECTIVES, PolicyConfig,
     )
     from policy.datasets import Bundle, ChunkDataset, compute_stats, default_drop_n_last_frames
     from policy.goal import (
@@ -51,7 +52,8 @@ if __package__ in (None, ""):
     from policy.model import ChunkPolicy
 else:
     from .config import (
-        ACTION_REPRS, DELTA_MODES, FLOW_TIME_SAMPLINGS, GOAL_SELECTIONS, OBJECTIVES, PolicyConfig,
+        ACTION_REPRS, DELTA_MODES, FLOW_TIME_SAMPLINGS, GOAL_SELECTIONS, GUIDANCE_MODES,
+        OBJECTIVES, PolicyConfig,
     )
     from .datasets import Bundle, ChunkDataset, compute_stats, default_drop_n_last_frames
     from .goal import (
@@ -203,6 +205,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     objective.add_argument("--guidance-weight", type=float, default=1.0,
                            help="Guidance used at validation and stored as the checkpoint's default. "
                                 "1.0 is plain conditional sampling; needs --cond-dropout above 0")
+    objective.add_argument("--guidance-mode", choices=GUIDANCE_MODES, default="full",
+                           help="What the guided branch drops. full: the whole conditioning "
+                                "vector (needs --cond-dropout). goal: only the goal frame, "
+                                "keeping the observation, so the weight scales the goal alone "
+                                "(--goal-conditioned with --goal-dropout above 0). Sampling-time "
+                                "only; this is the default a rollout starts from")
     objective.add_argument("--action-repr", choices=ACTION_REPRS, default="delta",
                            help="absolute: predict joint targets. delta: predict them relative to the state")
     objective.add_argument("--delta-mode", choices=DELTA_MODES, default="incremental")
@@ -320,6 +328,7 @@ def build_config(args: argparse.Namespace, bundle: Bundle, stats: dict) -> Polic
         use_proprio=args.use_proprio,
         cond_dropout=args.cond_dropout,
         guidance_weight=args.guidance_weight,
+        guidance_mode=args.guidance_mode,
         action_repr=args.action_repr,
         delta_mode=args.delta_mode,
         absolute_dims=absolute_dims,
@@ -560,7 +569,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"action       {action_description}")
     print(f"objective    {process}")
     print(f"unet         {tuple(args.down_dims)} kernel {args.kernel_size}")
-    print(f"guidance     cond dropout {args.cond_dropout} | weight {args.guidance_weight}"
+    print(f"guidance     cond dropout {args.cond_dropout} | weight {args.guidance_weight} | "
+          f"mode {args.guidance_mode}"
           f"{' (plain conditional)' if args.guidance_weight == 1.0 else ''}")
     if args.goal_conditioned:
         if args.goal_selection == "uniform4":

@@ -195,9 +195,10 @@ python src/policy/infer.py --checkpoint models/simple/G_pick_can/best.pt \
 
 If the two ratios match, the goal is decoration. `--goal-dropout` is what makes
 that comparison possible at all: it trains a null-goal embedding, so the same
-checkpoint can run with no goal. It is separate from `--cond-dropout`, which
-drops the *whole* conditioning vector, goal included, and is what
-classifier-free guidance needs.
+checkpoint can run with no goal — and that same embedding is what goal-only
+classifier-free guidance extrapolates away from (`--guidance-mode goal`, below).
+It is separate from `--cond-dropout`, which drops the *whole* conditioning
+vector, goal included, and is what the default `full` guidance needs.
 
 Both of those numbers are optimistic in the same way: validation and replay hand
 the policy a goal taken from the very episode it is being scored on, which is
@@ -252,6 +253,39 @@ A checkpoint trained without `--cond-dropout` **refuses** any weight other than
 embedding does not raise, it produces confident wrong actions, which on a robot
 is the worst possible failure mode.
 
+### What the guided branch drops: `--guidance-mode`
+
+There are two useful "unconditional" branches on a goal-conditioned policy, and
+the mode picks which one the weight extrapolates away from:
+
+| mode | the guided branch is | needs | the weight scales |
+|---|---|---|---|
+| `full` (default) | `null_cond` — no observation, no goal | `--cond-dropout` | everything the policy conditions on |
+| `goal` | this frame and this joint state, `null_goal` in place of the goal | `--goal-dropout` | the goal alone |
+
+`goal` is the mode a goal-conditioned rollout usually wants. Under `full`, a
+weight of 2.0 also sharpens how literally the policy reads the frame in front of
+it, which is not the question being asked; under `goal` the difference between
+the branches is exactly *"with this goal"* minus *"from this frame, no goal in
+particular"*, so the weight is a dial on how hard the arm is pushed towards the
+picture it was aimed at, with the scene it has to act in left alone.
+
+The requirement is only ever *was this null embedding trained* — which means
+**`--goal-dropout 0.1` already buys goal-only guidance**, and any existing
+goal-conditioned run with dropout can be guided this way without retraining:
+
+```bash
+python src/policy/infer.py --checkpoint models/simple/G_pick_can/best.pt \
+    --bundle pick-can-all --episode 0 \
+    --guidance-mode goal --guidance-weight 1.0 1.5 2.0 3.0
+```
+
+Goal-only guidance needs an actual goal: with none, both branches are the null
+goal, the extrapolation cancels, and the weight would quietly do nothing — so
+the runner refuses instead. `--guidance-mode` is a sampling-time choice, and
+`train.py` takes the same flag only to record the default a checkpoint starts
+from.
+
 Pick the weight offline, never on the arm:
 
 ```bash
@@ -273,8 +307,9 @@ step at a time.)
 ### Cost
 
 Guidance doubles the U-Net work but not the vision encoder: the conditional
-context is encoded once, the unconditional one is a learned constant, and both
-branches go through the U-Net as one batch of 2. Measured at the default config
+context is encoded once and the other branch is built out of it — a learned
+constant under `full`, the same vector with its goal slot swapped under `goal` —
+so both go through the U-Net as one batch of 2 and the ResNet still runs once. Measured at the default config
 (224px, 2 observation steps, `down_dims=(128,256,512)`, 10 sampler steps):
 
 | | RTX 3090 p50 | RTX 3080 p50 |
@@ -315,13 +350,19 @@ run, load it, and start a rollout; the page reads `n_action_steps` from the
 checkpoint so the execution horizon defaults to what the policy was trained for.
 
 For a guidance-capable checkpoint a **Guidance** section appears in the sidebar
-once the policy is loaded. Moving the slider and pressing Apply retunes the
-weight in place — no reload, no CUDA context rebuild, no warm-up — so trials at
-different weights are a few seconds apart rather than a few minutes. Applying it
-drops any queued chunk, so actions planned under the old weight never reach the
-arm, and it is refused outright while a rollout is running. Each recorded
-rollout's `meta.json` stores the weight that produced it. Checkpoints trained
-without `--cond-dropout` show no slider at all.
+once the policy is loaded, offering only the modes that checkpoint trained a
+null embedding for. Moving the slider and pressing Apply retunes the weight in
+place — no reload, no CUDA context rebuild, no warm-up — so trials at different
+weights are a few seconds apart rather than a few minutes; switching mode works
+the same way. Either drops any queued chunk, so actions planned under the old
+setting never reach the arm, and both are refused outright while a rollout is
+running. Each recorded rollout's `meta.json` stores the weight *and* the mode
+that produced it. A checkpoint with neither `--cond-dropout` nor
+`--goal-dropout` shows no section at all.
+
+The goal-conditioned page (`scripts/9_goal_policy_ui.sh`) is where goal-only
+guidance belongs: generate the video, aim at a frame, then turn the weight up to
+push the rollout harder towards it.
 
 **Run the control loop at the rate the demonstrations were recorded at.** The
 policy conditions on the last two frames, and the motion between them is the

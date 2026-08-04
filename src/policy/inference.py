@@ -26,11 +26,11 @@ import torch
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from policy.config import PolicyConfig
+    from policy.config import GUIDANCE_MODES, PolicyConfig
     from policy.data_prep import preprocess_frame
     from policy.model import ChunkPolicy
 else:
-    from .config import PolicyConfig
+    from .config import GUIDANCE_MODES, PolicyConfig
     from .data_prep import preprocess_frame
     from .model import ChunkPolicy
 
@@ -50,6 +50,7 @@ class PolicyRunner:
         action_steps: int | None = None,
         num_inference_steps: int | None = None,
         guidance_weight: float | None = None,
+        guidance_mode: str | None = None,
     ):
         self.checkpoint_path = Path(checkpoint_path)
         payload = torch.load(self.checkpoint_path, map_location="cpu", weights_only=False)
@@ -101,17 +102,25 @@ class PolicyRunner:
         # Refuse guidance the checkpoint cannot support. Sampling against an
         # untrained null embedding does not fail loudly - it produces confident,
         # wrong actions - so this has to be caught before the arm is enabled.
+        self.guidance_mode = str(
+            self.config.guidance_mode if guidance_mode is None else guidance_mode
+        )
+        if self.guidance_mode not in GUIDANCE_MODES:
+            raise ValueError(
+                f"guidance_mode must be one of {GUIDANCE_MODES}, got {self.guidance_mode!r}"
+            )
         self.guidance_weight = float(
             self.config.guidance_weight if guidance_weight is None else guidance_weight
         )
         if self.guidance_weight < 0.0:
             raise ValueError(f"guidance_weight must be >= 0, got {self.guidance_weight}")
-        if self.guidance_weight != 1.0 and self.config.cond_dropout <= 0.0:
-            raise ValueError(
-                f"{self.run_name} was trained with cond_dropout=0, so it has no unconditional "
-                f"branch and guidance_weight={self.guidance_weight} would extrapolate from an "
-                "untrained embedding. Retrain with --cond-dropout 0.1, or use guidance_weight=1.0."
-            )
+        if self.guidance_weight != 1.0:
+            reason = self.config.guidance_unavailable_reason(self.guidance_mode)
+            if reason is not None:
+                raise ValueError(
+                    f"{self.run_name}: guidance_weight={self.guidance_weight} in mode "
+                    f"{self.guidance_mode!r} {reason}"
+                )
 
         self.queue: deque[np.ndarray] = deque()
         self.frames: deque[torch.Tensor] = deque(maxlen=self.config.n_obs_steps)
@@ -127,7 +136,13 @@ class PolicyRunner:
 
     @property
     def supports_guidance(self) -> bool:
-        return self.config.cond_dropout > 0.0
+        """Whether a weight other than 1.0 is usable in the mode now selected."""
+        return self.config.guidance_available(self.guidance_mode)
+
+    @property
+    def guidance_modes(self) -> tuple[str, ...]:
+        """Every mode this checkpoint could be guided in, for the UI to offer."""
+        return self.config.guidance_modes
 
     @property
     def queued_actions(self) -> int:
@@ -159,11 +174,28 @@ class PolicyRunner:
         weight = float(weight)
         if weight < 0.0:
             raise ValueError(f"guidance_weight must be >= 0, got {weight}")
-        if weight != 1.0 and not self.supports_guidance:
-            raise ValueError(
-                f"{self.run_name} was trained with cond_dropout=0 and has no unconditional branch."
-            )
+        if weight != 1.0:
+            reason = self.config.guidance_unavailable_reason(self.guidance_mode)
+            if reason is not None:
+                raise ValueError(f"{self.run_name}: mode {self.guidance_mode!r} {reason}")
         self.guidance_weight = weight
+        self.queue.clear()
+
+    def set_guidance_mode(self, mode: str) -> None:
+        """Change what the guided branch drops, between rollouts.
+
+        Refused when the current weight could not be applied in the new mode:
+        switching to a mode whose null embedding was never trained has to fail
+        here rather than at the first step of a rollout.
+        """
+        mode = str(mode)
+        if self.guidance_weight != 1.0:
+            reason = self.config.guidance_unavailable_reason(mode)
+            if reason is not None:
+                raise ValueError(f"{self.run_name}: mode {mode!r} {reason}")
+        elif mode not in GUIDANCE_MODES:
+            raise ValueError(f"guidance_mode must be one of {GUIDANCE_MODES}, got {mode!r}")
+        self.guidance_mode = mode
         self.queue.clear()
 
     def reset(self) -> None:
@@ -184,7 +216,10 @@ class PolicyRunner:
     @torch.no_grad()
     def _predict_from_history(self) -> np.ndarray:
         batch = self.observation_batch()
-        return self.policy.predict(batch, guidance_weight=self.guidance_weight)[0].float().cpu().numpy()
+        actions = self.policy.predict(
+            batch, guidance_weight=self.guidance_weight, guidance_mode=self.guidance_mode
+        )
+        return actions[0].float().cpu().numpy()
 
     def predict_chunk(self, frame_bgr: np.ndarray, state: np.ndarray) -> np.ndarray:
         """Record the observation and predict a full chunk from it."""
@@ -258,6 +293,9 @@ class PolicyRunner:
             "n_obs_steps": self.config.n_obs_steps,
             "down_dims": list(self.config.down_dims),
             "guidance_weight": self.guidance_weight,
+            "guidance_mode": self.guidance_mode,
+            "guidance_modes": list(self.guidance_modes),
+            "supports_guidance": self.supports_guidance,
             "cond_dropout": self.config.cond_dropout,
             "goal_conditioned": self.config.goal_conditioned,
             "goal_selection": self.config.goal_selection,

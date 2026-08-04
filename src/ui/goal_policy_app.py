@@ -251,6 +251,25 @@ def checkpoint_panel() -> PolicySettings | None:
     if goal_dropout <= 0.0:
         st.caption("This checkpoint has no null-goal branch: it will refuse to step without a goal.")
 
+    # Both are retuned live in guidance_panel below; loading uses the trained
+    # defaults. Which modes are offered is decided by the runner after loading -
+    # this is only the heads-up, computed from the same two dropout rates.
+    cond_dropout = float(config.get("cond_dropout") or 0.0)
+    available = [
+        label
+        for label, trained in (
+            (f"goal-only (goal dropout {goal_dropout:g})", goal_dropout > 0.0),
+            (f"full (cond dropout {cond_dropout:g})", cond_dropout > 0.0),
+        )
+        if trained
+    ]
+    st.caption(
+        f"🎛 Classifier-free guidance available: {', '.join(available)}. Set the mode and "
+        "weight after loading."
+        if available
+        else "Guidance unavailable: trained with --cond-dropout 0 and --goal-dropout 0."
+    )
+
     with st.expander("Run details"):
         st.write(
             {
@@ -267,6 +286,9 @@ def checkpoint_panel() -> PolicySettings | None:
                 "goal_frame_index": frame_index,
                 "goal_window": config.get("goal_window"),
                 "goal_dropout": goal_dropout,
+                "cond_dropout": cond_dropout,
+                "guidance_weight": config.get("guidance_weight"),
+                "guidance_mode": config.get("guidance_mode", "full"),
                 "checkpoint": str(checkpoint.path),
             }
         )
@@ -281,6 +303,21 @@ def checkpoint_panel() -> PolicySettings | None:
     )
     device = st.selectbox("Device", ("cuda", "cpu"), index=0, disabled=driving)
     use_ema = st.checkbox("Use EMA weights", value=True, disabled=driving)
+    action_mode = st.radio(
+        "Policy action mode",
+        ("joint", "eef_ik"),
+        format_func=lambda value: (
+            "Joint targets"
+            if value == "joint"
+            else "EEF pose targets → numerical IK"
+        ),
+        disabled=driving,
+        help=(
+            "EEF IK requires a checkpoint trained with action columns "
+            "eef.x/eef.y/eef.z/eef.rx/eef.ry/eef.rz/gripper.pos. "
+            "Existing joint-target checkpoints must use Joint targets."
+        ),
+    )
 
     try:
         return PolicySettings(
@@ -288,6 +325,7 @@ def checkpoint_panel() -> PolicySettings | None:
             action_steps=action_steps,
             device=device,
             use_ema=use_ema,
+            action_mode=action_mode,
         )
     except ValueError as exc:
         st.error(str(exc))
@@ -351,6 +389,101 @@ def video_source_panel() -> VideoSourceConfig | None:
         return None
 
 
+GUIDANCE_MODE_LABELS = {
+    "goal": "goal only — amplify the goal, keep the frame",
+    "full": "full — amplify everything the policy sees",
+}
+
+
+def guidance_panel(loaded: PolicyInfo | None) -> None:
+    """Retune classifier-free guidance on the policy already in the hardware process.
+
+    The mode is the interesting control on this page. Under ``full`` the guided
+    branch is "no observation at all", so the weight sharpens the frame, the
+    measured state and the goal together. Under ``goal`` only the goal is
+    dropped: the branch is "this same scene, no goal in particular", and the
+    weight scales how hard the rollout is pushed towards the picture chosen
+    below while the policy keeps full sight of what is actually in front of it.
+    That is the knob this page wants - and it needs only ``--goal-dropout``,
+    which most goal-conditioned runs already have.
+
+    Either way the weight only sharpens the goal that was set: a wrong goal
+    driven at 3.0 is a worse rollout, not a better one. Judge the video first.
+
+    Changing either setting costs a queue flush; reloading the checkpoint would
+    rebuild the CUDA context and repeat the warm-up.
+    """
+    if loaded is None or not loaded.guidance_modes:
+        return
+
+    st.header("Guidance")
+    modes = list(loaded.guidance_modes)
+    mode = st.radio(
+        "Guided branch drops",
+        modes,
+        index=modes.index(loaded.guidance_mode) if loaded.guidance_mode in modes else 0,
+        format_func=lambda value: GUIDANCE_MODE_LABELS.get(value, value),
+        disabled=driving,
+        help=(
+            "goal: the unconditional branch keeps this frame and this joint state and only "
+            "blanks the goal, so the weight scales the goal's influence alone. full: it blanks "
+            "the whole conditioning vector, so the weight scales everything at once."
+        ),
+    )
+    if mode != loaded.guidance_mode:
+        if st.button(f"Apply {mode} guidance", width="stretch", disabled=driving):
+            try:
+                runtime.set_guidance_mode(mode)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not change the guidance mode: {exc}")
+        st.caption(f"Still running in **{loaded.guidance_mode}**; press to switch.")
+        return
+    if not loaded.supports_guidance:
+        return
+
+    weight = float(
+        st.slider(
+            "Classifier-free guidance weight",
+            min_value=1.0,
+            max_value=5.0,
+            value=float(loaded.guidance_weight),
+            step=0.1,
+            disabled=driving,
+            help=(
+                "1.0 is plain conditional sampling. Higher narrows the range of behaviours the "
+                "policy will commit to. Robotics weights are modest; 1.5-3.0 is the usual range."
+            ),
+        )
+    )
+
+    if abs(weight - loaded.guidance_weight) < 1e-9:
+        st.caption(
+            f"Active: {loaded.guidance_weight:g} ({loaded.guidance_mode})"
+            + (" (plain conditional)" if loaded.guidance_weight == 1.0 else "")
+        )
+    elif st.button(f"Apply guidance {weight:g}", width="stretch", disabled=driving):
+        try:
+            runtime.set_guidance_weight(weight)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not change the guidance weight: {exc}")
+
+    if weight > 1.0:
+        st.caption(
+            "Guidance runs the U-Net twice per sampler step. It is close to free on a GPU, "
+            "but check the inference p95 against the control budget in the telemetry panel."
+        )
+    if weight > 1.0 and loaded.guidance_mode == "goal" and not loaded.has_goal:
+        # Both branches would be the null goal, so the weight would do nothing;
+        # the runner refuses at the first step rather than drifting silently.
+        st.warning(
+            "Goal-only guidance needs a goal. Aim at a frame below, or the first step of the "
+            "rollout will fail.",
+            icon="🎯",
+        )
+
+
 with st.sidebar:
     st.header("Checkpoint")
     policy_settings = checkpoint_panel()
@@ -369,13 +502,25 @@ with st.sidebar:
             with st.spinner("Loading weights and running one warm-up inference…"):
                 runtime.load_policy(policy_settings)
             # A new policy has no goal, so the video on screen is not its goal.
+            # The generated video stays on disk; only the aim is dropped.
             st.session_state.pop("_goal_video", None)
+            st.session_state.pop("_goal_video_dir", None)
+            st.session_state.pop("_aimed_goal", None)
             st.rerun()
         except Exception as exc:
             st.error(f"Could not load the checkpoint: {exc}")
 
+    guidance_panel(loaded_policy)
+
     st.header("Goal video")
     video_source = video_source_panel()
+    keep_goal_videos = st.checkbox(
+        "Keep every generated video",
+        value=True,
+        help="Writes each clip to `goal_videos/` under the rollout output directory, and the "
+             "one actually aimed at into the episode that ran against it. Generation is not "
+             "reproducible unless the seed is fixed, so an unsaved video is gone.",
+    )
 
     st.header("Robot")
     can_port = st.text_input("Piper CAN interface", "piper_left", disabled=hardware_locked)
@@ -569,6 +714,51 @@ def preview_panel() -> None:
     )
 
 
+def _archive_goal_video(video: GoalVideo) -> Path:
+    """Write a freshly generated video to its own directory under the output dir.
+
+    Every generated video is kept, not only the one that ends up driving a
+    rollout: rejecting a video is a judgement about the video model, and the
+    rejected ones are the examples that judgement was made on.
+    """
+    base = Path(output_dir) / "goal_videos"
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    directory = base / stamp
+    attempt = 1
+    while directory.exists():  # two generations inside one second
+        directory = base / f"{stamp}_{attempt}"
+        attempt += 1
+    return video.save(directory, extra={"task": task, "generated_for": "goal_policy_app"})
+
+
+def _save_goal_with_episode(episode_dir: Path) -> str | None:
+    """Copy the goal the rollout ran against into the episode it produced.
+
+    What is written is the video the operator pressed *Aim* on, not whatever is
+    on screen now - a video generated after aiming, and not aimed at, never
+    reached the policy. Returns a line to show the operator, or None when there
+    was no goal to record.
+    """
+    aimed = st.session_state.get("_aimed_goal")
+    if aimed is None:
+        return None
+    try:
+        written = aimed["video"].save(
+            episode_dir / "goal_video",
+            chosen_index=aimed["index"],
+            extra={
+                "episode": episode_dir.name,
+                "generated_archive": aimed["archive"],
+                "note": "the goal this episode was driven towards; goal.png is the frame itself",
+            },
+        )
+    except Exception as exc:
+        # The episode is already committed on disk; losing the goal copy is bad
+        # but it is not a reason to make the save look like it failed.
+        return f"⚠️ The episode was saved but its goal video was not: {exc}"
+    return f"🎯 Goal video written to `{written}`"
+
+
 def goal_panel(policy: PolicyInfo | None) -> None:
     """Generate a video from the current frame, then choose the goal out of it.
 
@@ -597,12 +787,24 @@ def goal_panel(policy: PolicyInfo | None) -> None:
                 video = runtime.generate_goal_video(video_source)
             st.session_state["_goal_video"] = video
             st.session_state["_goal_frame_index"] = video.goal_index
+            # Written before the rerun that displays it, so a video that is
+            # looked at once and regenerated over is still on disk. Reported
+            # through session state because the rerun clears anything drawn here.
+            st.session_state["_goal_video_dir"] = None
+            st.session_state["_goal_video_error"] = None
+            if keep_goal_videos:
+                try:
+                    st.session_state["_goal_video_dir"] = str(_archive_goal_video(video))
+                except Exception as exc:
+                    st.session_state["_goal_video_error"] = str(exc)
             st.rerun()
         except Exception as exc:
             st.error("Generation failed. Complete traceback:")
             st.code(str(exc), language=None, wrap_lines=True)
     if clear_column.button("🗑 Clear", width="stretch", disabled=driving):
         st.session_state.pop("_goal_video", None)
+        st.session_state.pop("_goal_video_dir", None)
+        st.session_state.pop("_aimed_goal", None)
         try:
             runtime.set_goal_frame(None)
         except Exception as exc:
@@ -621,6 +823,15 @@ def goal_panel(policy: PolicyInfo | None) -> None:
         f"{video.frame_count} frames from {video.source} in {video.seconds:.1f}s · "
         f"default goal frame {video.goal_index}"
     )
+    if st.session_state.get("_goal_video_error"):
+        st.warning(
+            f"This video could not be written to disk: {st.session_state['_goal_video_error']}",
+            icon="💾",
+        )
+    elif st.session_state.get("_goal_video_dir"):
+        st.caption(f"💾 Kept in `{st.session_state['_goal_video_dir']}`")
+    elif not keep_goal_videos:
+        st.caption("💾 Not being kept: enable *Keep every generated video* in the sidebar.")
     # A short clip is a strip of stills - all four states at once is easier to
     # judge than four seconds of playback. A long one is a video.
     if video.frame_count <= 8:
@@ -647,6 +858,14 @@ def goal_panel(policy: PolicyInfo | None) -> None:
     if st.button(f"🎯 Aim at frame {chosen}", type="primary", width="stretch", disabled=driving):
         try:
             runtime.set_goal_frame(video.frames_png[chosen])
+            # Remembered here rather than read back at save time: this is the
+            # picture the policy is actually driving towards, and the page may
+            # be showing a newer video by the time the rollout finishes.
+            st.session_state["_aimed_goal"] = {
+                "video": video,
+                "index": int(chosen),
+                "archive": st.session_state.get("_goal_video_dir"),
+            }
             st.rerun()
         except Exception as exc:
             st.error(f"Could not set the goal: {exc}")
@@ -757,10 +976,15 @@ def rollout_panel() -> None:
                 f"{current.rollout_samples} steps recorded · {current.plans} predictions"
             ),
         )
+        guidance = (
+            f" · guidance {current.policy.guidance_weight:g} ({current.policy.guidance_mode})"
+            if current.policy is not None and current.policy.guidance_weight != 1.0
+            else ""
+        )
         st.caption(
             f"queue {current.queued_actions} action(s) · "
             f"inference p95 {current.inference_latency.p95_ms:.0f} ms · "
-            f"{current.missed_rollout_frames} unrecorded step(s)"
+            f"{current.missed_rollout_frames} unrecorded step(s){guidance}"
         )
         if st.button("⏹ STOP ROLLOUT", type="primary", width="stretch"):
             try:
@@ -788,6 +1012,7 @@ def rollout_panel() -> None:
                 try:
                     saved = runtime.save_rollout()
                     st.session_state["_last_saved_rollout"] = str(saved)
+                    st.session_state["_last_saved_goal"] = _save_goal_with_episode(saved)
                     st.session_state["_saved_rollouts"] = (
                         st.session_state.get("_saved_rollouts", 0) + 1
                     )
@@ -806,6 +1031,8 @@ def rollout_panel() -> None:
 
     if st.session_state.get("_last_saved_rollout"):
         st.success(f"Saved {st.session_state['_last_saved_rollout']}")
+        if st.session_state.get("_last_saved_goal"):
+            st.caption(st.session_state["_last_saved_goal"])
     outcome_tally(output_dir)
 
     if current.state is PolicyState.IDLE:

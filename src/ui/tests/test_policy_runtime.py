@@ -88,6 +88,7 @@ class FakeRunner:
         self.reset_calls = 0
         self.states: list[list[float]] = []
         self.guidance_weight = 1.0
+        self.guidance_mode = "full"
         self.goal: Any = None
 
     @property
@@ -106,6 +107,12 @@ class FakeRunner:
     def set_guidance_weight(self, weight: float) -> None:
         # Mirrors PolicyRunner: the queued chunk came from the old weight.
         self.guidance_weight = float(weight)
+        self.queue.clear()
+
+    def set_guidance_mode(self, mode: str) -> None:
+        # Mirrors PolicyRunner: a chunk planned in the other mode is not what
+        # this one would have produced.
+        self.guidance_mode = str(mode)
         self.queue.clear()
 
     @property
@@ -229,10 +236,14 @@ def fake_policy_info(**overrides: Any) -> PolicyInfo:
 
 class Harness:
     def __init__(self, fail_after: int | None = None, move_delay_s: float = 0.0,
-                 supports_guidance: bool = False, goal_conditioned: bool = False) -> None:
+                 supports_guidance: bool = False, goal_conditioned: bool = False,
+                 guidance_modes: tuple[str, ...] | None = None) -> None:
         self.robot = FakeRobot(fail_after)
         self.runner = FakeRunner()
         self.supports_guidance = supports_guidance
+        self.guidance_modes = (
+            guidance_modes if guidance_modes is not None else (("full",) if supports_guidance else ())
+        )
         self.goal_conditioned = goal_conditioned
         self.camera: FakeCamera | None = None
         self.emergency_calls = 0
@@ -270,6 +281,8 @@ class Harness:
                 checkpoint=str(settings.checkpoint),
                 supports_guidance=self.supports_guidance,
                 guidance_weight=settings.guidance_weight or 1.0,
+                guidance_mode=settings.guidance_mode or "full",
+                guidance_modes=self.guidance_modes,
                 goal_conditioned=self.goal_conditioned,
                 has_goal=self.runner.has_goal,
             ),
@@ -395,7 +408,7 @@ class GuidanceWeightTest(unittest.TestCase):
             runtime.load_policy(PolicySettings(checkpoint=Path(handle.name), device="cpu"))
         with self.assertRaises(RuntimeError) as error:
             runtime.set_guidance_weight(2.0)
-        self.assertIn("conditioning dropout", str(error.exception))
+        self.assertIn("guide away from", str(error.exception))
 
     def test_the_recorded_rollout_states_which_weight_produced_it(self) -> None:
         self._load_policy()
@@ -405,6 +418,88 @@ class GuidanceWeightTest(unittest.TestCase):
 
     def test_the_operation_is_reachable_across_the_process_boundary(self) -> None:
         self.assertIn("set_guidance_weight", _PROCESS_OPERATIONS)
+
+
+class GuidanceModeTest(unittest.TestCase):
+    """Switching what the guided branch drops: the whole context, or the goal."""
+
+    def setUp(self) -> None:
+        self.harness = Harness(
+            supports_guidance=True, goal_conditioned=True, guidance_modes=("full", "goal")
+        )
+        self.runtime = self.harness.runtime()
+        self.temporary = tempfile.TemporaryDirectory()
+        self.output_dir = Path(self.temporary.name) / "rollouts"
+        self.addCleanup(self.temporary.cleanup)
+        self.addCleanup(self._safe_disconnect)
+
+    def _safe_disconnect(self) -> None:
+        if self.runtime.state is not PolicyState.DISCONNECTED:
+            try:
+                self.runtime.disconnect()
+            except BaseException:
+                pass
+
+    def _load_policy(self, **kwargs) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
+            self.runtime.load_policy(
+                PolicySettings(checkpoint=Path(handle.name), device="cpu", **kwargs)
+            )
+
+    def test_the_mode_reaches_the_runner_without_reloading_the_weights(self) -> None:
+        self._load_policy()
+        snapshot = self.runtime.set_guidance_mode("goal")
+        self.assertEqual(snapshot.policy.guidance_mode, "goal")
+        self.assertEqual(self.harness.runner.guidance_mode, "goal")
+        self.assertEqual(self.harness.policy_calls, 1)
+
+    def test_the_mode_can_be_chosen_at_load_time(self) -> None:
+        self._load_policy(guidance_mode="goal")
+        self.assertEqual(self.runtime.get_snapshot().policy.guidance_mode, "goal")
+
+    def test_switching_drops_the_queued_chunk(self) -> None:
+        # A chunk planned under full guidance is not what goal-only would give.
+        self._load_policy()
+        self.harness.runner.queue = [[1.0] * len(ACTION_KEYS)]
+        self.runtime.set_guidance_mode("goal")
+        self.assertEqual(self.harness.runner.queued_actions, 0)
+
+    def test_a_mode_the_checkpoint_never_trained_is_refused(self) -> None:
+        harness = Harness(supports_guidance=True, guidance_modes=("full",))
+        runtime = harness.runtime()
+        with tempfile.NamedTemporaryFile(suffix=".pt") as handle:
+            runtime.load_policy(
+                PolicySettings(checkpoint=Path(handle.name), device="cpu", guidance_weight=2.0)
+            )
+        with self.assertRaises(RuntimeError) as error:
+            runtime.set_guidance_mode("goal")
+        self.assertIn("goal", str(error.exception))
+
+    def test_switching_is_refused_while_the_arm_is_driven(self) -> None:
+        self._load_policy()
+        self.runtime.connect(runtime_config())
+        self.runtime.start_rollout(RolloutConfig(output_dir=self.output_dir, duration_s=None))
+        wait_until(lambda: self.harness.robot.send_count() >= 2)
+        with self.assertRaises(RuntimeError):
+            self.runtime.set_guidance_mode("goal")
+        self.runtime.stop_rollout()
+        self.runtime.set_guidance_mode("goal")
+        self.assertEqual(self.harness.runner.guidance_mode, "goal")
+
+    def test_the_recorded_rollout_states_which_mode_produced_it(self) -> None:
+        self._load_policy()
+        self.runtime.set_guidance_mode("goal")
+        self.runtime.set_guidance_weight(2.0)
+        meta = _policy_meta(self.runtime.get_snapshot().policy)
+        self.assertEqual(meta["guidance_mode"], "goal")
+        self.assertAlmostEqual(meta["guidance_weight"], 2.0)
+
+    def test_the_headline_names_the_mode_it_is_guiding_in(self) -> None:
+        info = fake_policy_info(guidance_weight=2.0, guidance_mode="goal")
+        self.assertIn("guidance 2 (goal)", info.headline())
+
+    def test_the_operation_is_reachable_across_the_process_boundary(self) -> None:
+        self.assertIn("set_guidance_mode", _PROCESS_OPERATIONS)
 
 
 class PolicyRuntimeTest(unittest.TestCase):

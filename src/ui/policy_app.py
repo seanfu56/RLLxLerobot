@@ -237,6 +237,7 @@ def checkpoint_panel() -> PolicySettings | None:
                 "action_repr": config.get("action_repr"),
                 "cond_dropout": config.get("cond_dropout"),
                 "guidance_weight": config.get("guidance_weight"),
+                "guidance_mode": config.get("guidance_mode", "full"),
                 "goal_conditioned": config.get("goal_conditioned"),
                 "goal_selection": config.get("goal_selection"),
                 "goal_frame_index": config.get("goal_frame_index"),
@@ -288,14 +289,27 @@ def checkpoint_panel() -> PolicySettings | None:
         else None
     )
 
-    # The weight itself is retuned live, after loading, in guidance_panel below.
-    # Loading uses whatever the checkpoint was trained with.
+    # The mode and weight are retuned live, after loading, in guidance_panel
+    # below. Loading uses whatever the checkpoint was trained with. Each mode
+    # guides away from a different null embedding, and each needs its own
+    # dropout to have trained it.
     cond_dropout = float(config.get("cond_dropout") or 0.0)
+    goal_guidance = bool(config.get("goal_conditioned")) and float(
+        config.get("goal_dropout") or 0.0
+    ) > 0.0
+    modes = [
+        label
+        for label, trained in (
+            ("goal-only", goal_guidance),
+            (f"full (cond dropout {cond_dropout:g})", cond_dropout > 0.0),
+        )
+        if trained
+    ]
     st.caption(
-        f"🎛 Classifier-free guidance available (trained with cond dropout {cond_dropout:g}); "
-        "set the weight after loading."
-        if cond_dropout > 0.0
-        else "Guidance unavailable: trained with --cond-dropout 0."
+        f"🎛 Classifier-free guidance available: {', '.join(modes)}. Set the mode and weight "
+        "after loading."
+        if modes
+        else "Guidance unavailable: trained with --cond-dropout 0 and --goal-dropout 0."
     )
     # Goal conditioning. The goal is fixed for the whole rollout, so it is a load
     # -time setting rather than something to retune live like the guidance weight.
@@ -345,18 +359,53 @@ def checkpoint_panel() -> PolicySettings | None:
         return None
 
 
+GUIDANCE_MODE_LABELS = {
+    "goal": "goal only — amplify the goal, keep the frame",
+    "full": "full — amplify everything the policy sees",
+}
+
+
 def guidance_panel(loaded: PolicyInfo | None) -> None:
     """Retune classifier-free guidance on the policy already in the hardware process.
 
-    Changing the weight here costs nothing but a queue flush; reloading the
-    checkpoint would rebuild the CUDA context and repeat the warm-up. Only shown
-    for checkpoints that were trained with conditioning dropout, because the
-    runtime refuses any other weight on the rest.
+    Changing either setting here costs nothing but a queue flush; reloading the
+    checkpoint would rebuild the CUDA context and repeat the warm-up. Only the
+    modes whose null embedding was actually trained are offered - "full" needs
+    --cond-dropout, "goal" needs a goal-conditioned run with --goal-dropout -
+    because the runtime refuses a weight the checkpoint cannot support.
     """
-    if loaded is None or not loaded.supports_guidance:
+    if loaded is None or not loaded.guidance_modes:
         return
 
     st.header("Guidance")
+    modes = list(loaded.guidance_modes)
+    # Hidden only when there is one mode and it is already the active one -
+    # a goal-conditioned run defaults to "full" while offering only "goal".
+    if modes != [loaded.guidance_mode]:
+        mode = st.radio(
+            "Guided branch drops",
+            modes,
+            index=modes.index(loaded.guidance_mode) if loaded.guidance_mode in modes else 0,
+            format_func=lambda value: GUIDANCE_MODE_LABELS.get(value, value),
+            disabled=driving,
+            help=(
+                "goal: blank only the goal frame, keeping this observation, so the weight "
+                "scales the goal's influence alone. full: blank the whole conditioning vector. "
+                "The goal-conditioned page is the one built around the first."
+            ),
+        )
+        if mode != loaded.guidance_mode:
+            if st.button(f"Apply {mode} guidance", width="stretch", disabled=driving):
+                try:
+                    runtime.set_guidance_mode(mode)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not change the guidance mode: {exc}")
+            st.caption(f"Still running in **{loaded.guidance_mode}**; press to switch.")
+            return
+    if not loaded.supports_guidance:
+        return
+
     weight = float(
         st.slider(
             "Classifier-free guidance weight",
@@ -366,8 +415,8 @@ def guidance_panel(loaded: PolicyInfo | None) -> None:
             step=0.1,
             disabled=driving,
             help=(
-                "1.0 is plain conditional sampling. Higher sharpens the policy onto what the "
-                "current observation implies and narrows the range of behaviours it will "
+                "1.0 is plain conditional sampling. Higher sharpens the policy onto whatever "
+                "the selected mode conditions on and narrows the range of behaviours it will "
                 "commit to. Robotics weights are modest; 1.5-3.0 is the usual range."
             ),
         )
@@ -375,7 +424,7 @@ def guidance_panel(loaded: PolicyInfo | None) -> None:
 
     if abs(weight - loaded.guidance_weight) < 1e-9:
         st.caption(
-            f"Active: {loaded.guidance_weight:g}"
+            f"Active: {loaded.guidance_weight:g} ({loaded.guidance_mode})"
             + (" (plain conditional)" if loaded.guidance_weight == 1.0 else "")
         )
     elif st.button(f"Apply guidance {weight:g}", width="stretch", disabled=driving):
@@ -776,7 +825,7 @@ def rollout_panel() -> None:
             ),
         )
         guidance = (
-            f" · guidance {current.policy.guidance_weight:g}"
+            f" · guidance {current.policy.guidance_weight:g} ({current.policy.guidance_mode})"
             if current.policy is not None and current.policy.guidance_weight != 1.0
             else ""
         )

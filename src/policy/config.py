@@ -33,9 +33,24 @@ NORM_MODES = ("meanstd", "minmax", "identity")
 # policy.goal imports policy.config, not the other way round.
 GOAL_SELECTIONS = ("uniform4", "tail", "future_uniform")
 
+# What the unconditional branch of classifier-free guidance drops.
+#
+# "full"  the whole conditioning vector, observation and goal together, is
+#         replaced by ``null_cond``. Guidance then amplifies everything the
+#         policy is conditioned on. Needs cond_dropout > 0.
+# "goal"  only the goal feature is replaced, by ``null_goal``; the observation
+#         and the measured state stay exactly as they are. Guidance then
+#         amplifies the goal alone - "do this rather than whatever you would do
+#         from this frame anyway" - which is the knob a goal-conditioned rollout
+#         actually wants. Needs goal_dropout > 0, which is the same flag that
+#         makes a checkpoint runnable with no goal, so most goal-conditioned runs
+#         already support it without retraining.
+GUIDANCE_MODES = ("full", "goal")
+
 __all__ = [
     "ACTION_REPRS", "BETA_SCHEDULES", "DELTA_MODES", "FLOW_TIME_SAMPLINGS", "GOAL_SELECTIONS",
-    "NORM_MODES", "OBJECTIVES", "POLICY_KIND", "POOL", "PolicyConfig", "VISION", "target_stats",
+    "GUIDANCE_MODES", "NORM_MODES", "OBJECTIVES", "POLICY_KIND", "POOL", "PolicyConfig", "VISION",
+    "target_stats",
 ]
 
 
@@ -119,6 +134,11 @@ class PolicyConfig:
     # a weight other than 1.0 requires cond_dropout > 0.
     cond_dropout: float = 0.0
     guidance_weight: float = 1.0
+    # Which conditioning the guided branch drops; see GUIDANCE_MODES. This is a
+    # sampling-time choice, not something training changes - "goal" only needs
+    # the null-goal embedding goal_dropout already trains - so it is recorded
+    # here as the checkpoint's default and can be overridden per rollout.
+    guidance_mode: str = "full"
 
     # --- action representation (see policy.datasets.compute_stats for the delta conventions) ---
     action_repr: str = "absolute"
@@ -206,13 +226,21 @@ class PolicyConfig:
 
         if not 0.0 <= self.cond_dropout < 1.0:
             raise ValueError(f"cond_dropout must be in [0, 1), got {self.cond_dropout}")
-        if self.guidance_weight != 1.0 and self.cond_dropout <= 0.0:
+        if self.guidance_mode not in GUIDANCE_MODES:
             raise ValueError(
-                f"guidance_weight={self.guidance_weight} needs an unconditional branch, but "
-                "cond_dropout is 0. Train with --cond-dropout 0.1 to use classifier-free guidance."
+                f"guidance_mode must be one of {GUIDANCE_MODES}, got {self.guidance_mode!r}"
+            )
+        if self.guidance_mode == "goal" and not self.goal_conditioned:
+            raise ValueError(
+                "guidance_mode='goal' drops the goal from the guided branch, which only a "
+                "--goal-conditioned run has."
             )
         if self.guidance_weight < 0.0:
             raise ValueError(f"guidance_weight must be >= 0, got {self.guidance_weight}")
+        if self.guidance_weight != 1.0:
+            reason = self.guidance_unavailable_reason()
+            if reason is not None:
+                raise ValueError(f"guidance_weight={self.guidance_weight} {reason}")
 
         if self.action_norm != "minmax" and self.clip_sample:
             raise ValueError(
@@ -224,6 +252,50 @@ class PolicyConfig:
     def chunk_size(self) -> int:
         """Alias for ``horizon``; the shared checkpoint picker asks for this name."""
         return self.horizon
+
+    # ------------------------------------------------------------------
+    # classifier-free guidance
+    # ------------------------------------------------------------------
+    #
+    # Both questions below are answered here rather than in the model, because
+    # the runner, the CLI and the Streamlit pages all have to ask them - the
+    # pages from a run.json, without importing torch at all - and a guidance
+    # weight applied against an untrained null embedding produces confident
+    # wrong actions rather than an error.
+
+    def guidance_unavailable_reason(self, mode: str | None = None) -> str | None:
+        """Why guidance cannot be used in ``mode``, or None when it can.
+
+        The requirement is only ever "was this null embedding trained": "full"
+        extrapolates away from ``null_cond``, which ``cond_dropout`` trains, and
+        "goal" away from ``null_goal``, which ``goal_dropout`` trains.
+        """
+        mode = self.guidance_mode if mode is None else mode
+        if mode not in GUIDANCE_MODES:
+            return f"is not a known guidance mode; use one of {GUIDANCE_MODES}."
+        if mode == "goal":
+            if not self.goal_conditioned:
+                return "needs a --goal-conditioned run; this one has no goal to drop."
+            if self.goal_dropout <= 0.0:
+                return (
+                    "needs a trained null-goal embedding, but goal_dropout is 0. Retrain with "
+                    "--goal-dropout 0.1, or guide in the 'full' mode."
+                )
+            return None
+        if self.cond_dropout <= 0.0:
+            return (
+                "needs an unconditional branch, but cond_dropout is 0. Train with "
+                "--cond-dropout 0.1 to use classifier-free guidance."
+            )
+        return None
+
+    def guidance_available(self, mode: str | None = None) -> bool:
+        return self.guidance_unavailable_reason(mode) is None
+
+    @property
+    def guidance_modes(self) -> tuple[str, ...]:
+        """The modes this checkpoint can actually be guided in, possibly none."""
+        return tuple(mode for mode in GUIDANCE_MODES if self.guidance_available(mode))
 
     def to_dict(self) -> dict:
         """Serialised config, plus the descriptive keys the run picker reads.

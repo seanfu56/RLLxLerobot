@@ -49,6 +49,24 @@ def tiny_config(**overrides) -> PolicyConfig:
     return PolicyConfig(**defaults)
 
 
+def goal_batch(config: PolicyConfig, size: int = 2, goal: bool = True) -> dict:
+    """One synthetic training batch, with or without the goal frame."""
+    generator = torch.Generator().manual_seed(0)
+    shape = (size, config.n_obs_steps, 3, config.image_size, config.image_size)
+    batch = {
+        "image": torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator),
+        "state": torch.randn(size, config.n_obs_steps, config.state_dim, generator=generator),
+        "action": torch.randn(size, config.horizon, config.action_dim, generator=generator),
+        "action_is_pad": torch.zeros(size, config.horizon, dtype=torch.bool),
+    }
+    if goal:
+        batch["goal_image"] = torch.randint(
+            0, 256, (size, 3, config.image_size, config.image_size),
+            dtype=torch.uint8, generator=generator,
+        )
+    return batch
+
+
 class GoalWindowTests(unittest.TestCase):
     def test_the_goal_comes_from_the_last_n_frames(self) -> None:
         self.assertEqual(goal_offset_range(100, 10), (90, 100))
@@ -233,20 +251,7 @@ class GoalDatasetTests(unittest.TestCase):
 
 class GoalPolicyTests(unittest.TestCase):
     def _batch(self, config: PolicyConfig, size: int = 2, goal: bool = True) -> dict:
-        generator = torch.Generator().manual_seed(0)
-        shape = (size, config.n_obs_steps, 3, config.image_size, config.image_size)
-        batch = {
-            "image": torch.randint(0, 256, shape, dtype=torch.uint8, generator=generator),
-            "state": torch.randn(size, config.n_obs_steps, config.state_dim, generator=generator),
-            "action": torch.randn(size, config.horizon, config.action_dim, generator=generator),
-            "action_is_pad": torch.zeros(size, config.horizon, dtype=torch.bool),
-        }
-        if goal:
-            batch["goal_image"] = torch.randint(
-                0, 256, (size, 3, config.image_size, config.image_size),
-                dtype=torch.uint8, generator=generator,
-            )
-        return batch
+        return goal_batch(config, size, goal)
 
     def test_the_conditioning_vector_grows_by_exactly_one_image_feature(self) -> None:
         plain = ChunkPolicy(tiny_config(goal_conditioned=False))
@@ -353,6 +358,115 @@ class GoalPolicyTests(unittest.TestCase):
     def test_goal_dropout_without_goal_conditioning_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             tiny_config(goal_conditioned=False, goal_dropout=0.1)
+
+
+class GoalOnlyGuidanceTests(unittest.TestCase):
+    """Guidance that drops the goal alone and keeps the observation.
+
+    The point of the mode: the weight scales how hard the policy is pushed
+    towards the goal, without also scaling how literally it reads the frame in
+    front of it.
+    """
+
+    def test_the_guided_branch_keeps_the_observation_and_blanks_the_goal(self) -> None:
+        config = tiny_config(goal_dropout=0.1, guidance_mode="goal")
+        policy = GoalChunkPolicy(config).eval()
+        batch = goal_batch(config)
+        feature_dim = policy.rgb_encoder.feature_dim
+
+        context = policy.encode_context(batch)
+        guided = policy.guidance_context(context, "goal")
+        torch.testing.assert_close(guided[:, :-feature_dim], policy.observation_features(batch))
+        torch.testing.assert_close(
+            guided[:, -feature_dim:], policy.null_goal.expand(context.shape[0], -1)
+        )
+
+    def test_full_guidance_still_blanks_everything(self) -> None:
+        config = tiny_config(goal_dropout=0.1, cond_dropout=0.1)
+        policy = GoalChunkPolicy(config).eval()
+        context = policy.encode_context(goal_batch(config))
+        torch.testing.assert_close(
+            policy.guidance_context(context, "full"),
+            policy.null_cond.expand(context.shape[0], -1),
+        )
+
+    def test_the_two_modes_produce_different_actions(self) -> None:
+        """Otherwise the mode would be a label rather than a change of branch."""
+        config = tiny_config(goal_dropout=0.1, cond_dropout=0.1, num_inference_steps=2)
+        policy = GoalChunkPolicy(config).eval()
+        batch = goal_batch(config)
+        action = torch.randn(2, config.horizon, config.action_dim)
+        timesteps = torch.zeros(2, dtype=torch.long)
+        context = policy.encode_context(batch)
+
+        goal_only = policy._decoder_fn(context, 2.5, "goal")(action, timesteps)
+        full = policy._decoder_fn(context, 2.5, "full")(action, timesteps)
+        self.assertFalse(torch.allclose(goal_only, full, atol=1e-4))
+
+    def test_it_is_the_usual_extrapolation_between_the_two_branches(self) -> None:
+        config = tiny_config(goal_dropout=0.1, guidance_mode="goal")
+        policy = GoalChunkPolicy(config).eval()
+        batch = goal_batch(config)
+        action = torch.randn(2, config.horizon, config.action_dim)
+        timesteps = torch.zeros(2, dtype=torch.long)
+
+        context = policy.encode_context(batch)
+        conditional = policy.unet(action, timesteps, context)
+        unconditional = policy.unet(action, timesteps, policy.guidance_context(context, "goal"))
+        torch.testing.assert_close(
+            policy._decoder_fn(context, 2.5, "goal")(action, timesteps),
+            unconditional + 2.5 * (conditional - unconditional),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    def test_it_needs_only_goal_dropout_not_cond_dropout(self) -> None:
+        """The null-goal embedding is what it guides away from, and goal_dropout
+        is what trains it - so a run with no cond_dropout at all can do this."""
+        config = tiny_config(goal_dropout=0.1, guidance_mode="goal", cond_dropout=0.0)
+        self.assertEqual(config.guidance_modes, ("goal",))
+        policy = GoalChunkPolicy(config).eval()
+        prediction = policy.predict(goal_batch(config), guidance_weight=2.0)
+        self.assertEqual(prediction.shape, (2, config.horizon, config.action_dim))
+
+    def test_an_untrained_null_goal_is_refused(self) -> None:
+        config = tiny_config(goal_dropout=0.0, cond_dropout=0.1)
+        policy = GoalChunkPolicy(config).eval()
+        with self.assertRaises(ValueError) as error:
+            policy.predict(goal_batch(config), guidance_weight=2.0, guidance_mode="goal")
+        self.assertIn("goal_dropout", str(error.exception))
+
+    def test_guiding_towards_no_goal_at_all_is_refused(self) -> None:
+        """Both branches would be the null goal, so the weight would do nothing."""
+        config = tiny_config(goal_dropout=0.1, guidance_mode="goal")
+        policy = GoalChunkPolicy(config).eval()
+        with self.assertRaises(ValueError) as error:
+            policy.predict(goal_batch(config, goal=False), guidance_weight=2.0)
+        self.assertIn("needs a goal frame", str(error.exception))
+
+    def test_without_guidance_a_missing_goal_is_still_fine(self) -> None:
+        config = tiny_config(goal_dropout=0.1, guidance_mode="goal")
+        policy = GoalChunkPolicy(config).eval()
+        prediction = policy.predict(goal_batch(config, goal=False))
+        self.assertEqual(prediction.shape, (2, config.horizon, config.action_dim))
+
+    def test_a_plain_policy_has_no_goal_branch_to_guide_away_from(self) -> None:
+        policy = ChunkPolicy(tiny_config(goal_conditioned=False, cond_dropout=0.1)).eval()
+        context = policy.encode_context(
+            {k: v for k, v in goal_batch(tiny_config()).items() if k != "goal_image"}
+        )
+        with self.assertRaises(ValueError):
+            policy.guidance_context(context, "goal")
+
+    def test_the_config_refuses_the_mode_on_a_run_that_has_no_goal(self) -> None:
+        with self.assertRaises(ValueError) as error:
+            tiny_config(goal_conditioned=False, guidance_mode="goal")
+        self.assertIn("goal-conditioned", str(error.exception))
+
+    def test_a_weight_the_mode_cannot_support_is_refused_at_config_time(self) -> None:
+        with self.assertRaises(ValueError) as error:
+            tiny_config(guidance_mode="goal", guidance_weight=2.0)
+        self.assertIn("goal_dropout", str(error.exception))
 
 
 class GoalTrainingTests(unittest.TestCase):
@@ -472,6 +586,65 @@ class GoalTrainingTests(unittest.TestCase):
             "--episode", "0", "--max-steps", "4", "--no-goal",
         ])
 
+    # --- goal-only guidance -------------------------------------------------
+    # This run trained --goal-dropout 0.2 and no conditioning dropout, so it is
+    # exactly the common case: guidable towards its goal, and not otherwise.
+
+    def test_goal_dropout_alone_makes_the_checkpoint_guidable_towards_its_goal(self) -> None:
+        runner = self._runner()
+        self.assertEqual(runner.guidance_modes, ("goal",))
+        # The default mode is "full", which this run has no branch for.
+        self.assertEqual(runner.guidance_mode, "full")
+        self.assertFalse(runner.supports_guidance)
+        runner.set_guidance_mode("goal")
+        self.assertTrue(runner.supports_guidance)
+
+    def test_the_mode_can_be_chosen_when_the_runner_is_built(self) -> None:
+        runner = self._runner(guidance_mode="goal", guidance_weight=2.0)
+        runner.set_goal(np.zeros((48, 64, 3), dtype=np.uint8))
+        action = runner.select_action(np.zeros((48, 64, 3), np.uint8), np.zeros(7, np.float32))
+        self.assertEqual(action.shape, (7,))
+
+    def test_a_weight_this_run_cannot_support_is_refused_in_full_mode(self) -> None:
+        with self.assertRaises(ValueError) as error:
+            self._runner(guidance_weight=2.0)
+        self.assertIn("cond_dropout", str(error.exception))
+
+    def test_switching_mode_drops_the_queued_chunk(self) -> None:
+        runner = self._runner(goal=np.zeros((48, 64, 3), dtype=np.uint8))
+        runner.select_action(np.zeros((48, 64, 3), np.uint8), np.zeros(7, np.float32))
+        self.assertGreater(runner.queued_actions, 0)
+        runner.set_guidance_mode("goal")
+        self.assertEqual(runner.queued_actions, 0)
+
+    def test_a_mode_with_no_trained_branch_is_refused_while_guided(self) -> None:
+        runner = self._runner(guidance_mode="goal", guidance_weight=2.0)
+        with self.assertRaises(ValueError) as error:
+            runner.set_guidance_mode("full")
+        self.assertIn("cond_dropout", str(error.exception))
+
+    def test_guiding_towards_a_goal_that_was_never_set_fails_at_the_first_step(self) -> None:
+        runner = self._runner(guidance_mode="goal", guidance_weight=2.0)
+        with self.assertRaises(ValueError) as error:
+            runner.select_action(np.zeros((48, 64, 3), np.uint8), np.zeros(7, np.float32))
+        self.assertIn("needs a goal frame", str(error.exception))
+
+    def test_describe_tells_the_ui_which_modes_are_on_offer(self) -> None:
+        description = self._runner(guidance_mode="goal").describe()
+        self.assertEqual(description["guidance_mode"], "goal")
+        self.assertEqual(description["guidance_modes"], ["goal"])
+        self.assertTrue(description["supports_guidance"])
+
+    def test_the_offline_replay_can_sweep_weights_in_goal_only_mode(self) -> None:
+        from policy.infer import main as infer_main
+
+        infer_main([
+            "--checkpoint", str(self.run_dir / "final.pt"), "--device", "cpu",
+            "--bundle", "tiny", "--data-root", str(self.data_root),
+            "--episode", "0", "--max-steps", "4",
+            "--guidance-mode", "goal", "--guidance-weight", "1.0", "2.0",
+        ])
+
 
 class GoalTrainingWithoutDropoutTests(unittest.TestCase):
     """A checkpoint trained with goal_dropout=0 must not be run without a goal."""
@@ -529,6 +702,22 @@ class GoalArgumentTests(unittest.TestCase):
 
         args = parse_args(["--bundle", "tiny", "--goal-conditioned", "--goal-window", "5"])
         self.assertEqual(warn_about_ignored_flags(args), [])
+
+    def test_the_guided_branch_drops_everything_by_default(self) -> None:
+        self.assertEqual(parse_args(["--bundle", "tiny"]).guidance_mode, "full")
+
+    def test_goal_only_guidance_can_be_made_the_checkpoint_default(self) -> None:
+        args = parse_args([
+            "--bundle", "tiny", "--goal-conditioned", "--goal-dropout", "0.1",
+            "--guidance-mode", "goal", "--guidance-weight", "2.0",
+        ])
+        self.assertEqual(args.guidance_mode, "goal")
+        config = tiny_config(
+            goal_dropout=args.goal_dropout,
+            guidance_mode=args.guidance_mode,
+            guidance_weight=args.guidance_weight,
+        )
+        self.assertEqual(config.guidance_modes, ("goal",))
 
 
 if __name__ == "__main__":

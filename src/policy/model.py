@@ -304,14 +304,29 @@ class ChunkPolicy(nn.Module):
     def unconditional_context(self, batch_size: int, dtype: torch.dtype) -> Tensor:
         return self.null_cond.to(dtype).expand(batch_size, -1)
 
-    def _decoder_fn(self, context: Tensor, guidance_weight: float):
+    def guidance_context(self, context: Tensor, mode: str) -> Tensor:
+        """The context the guided branch runs against, given the conditional one.
+
+        Guidance extrapolates away from whatever this returns, so it defines
+        what "unconditional" means. Here it is the learned no-observation
+        embedding; ``policy.goal.GoalChunkPolicy`` overrides it to offer a
+        branch that drops only the goal.
+        """
+        if mode != "full":
+            raise ValueError(
+                f"{type(self).__name__} only supports guidance_mode='full', not {mode!r}."
+            )
+        return self.unconditional_context(context.shape[0], context.dtype)
+
+    def _decoder_fn(self, context: Tensor, guidance_weight: float, mode: str = "full"):
         """The decoder call the sampler drives, guided when the weight is not 1.
 
         Guidance costs one extra U-Net pass per sampler step, not one extra
         forward pass of the whole policy: the conditional context is encoded once
-        and the unconditional one is a learned constant, so the ResNet - the
-        expensive half - still runs exactly once per prediction. The two branches
-        go through the U-Net as a single batch of 2B.
+        and ``guidance_context`` builds the other branch out of it without
+        touching the images, so the ResNet - the expensive half - still runs
+        exactly once per prediction either way. The two branches go through the
+        U-Net as a single batch of 2B.
 
         The extrapolation below is linear in the U-Net's output, so it is the
         correct guidance rule for both an epsilon prediction and a velocity.
@@ -319,7 +334,7 @@ class ChunkPolicy(nn.Module):
         if guidance_weight == 1.0:
             return lambda action_input, timesteps: self.unet(action_input, timesteps, context)
 
-        uncond = self.unconditional_context(context.shape[0], context.dtype)
+        uncond = self.guidance_context(context, mode)
         both = torch.cat([context, uncond], dim=0)
 
         def guided(action_input: Tensor, timesteps: Tensor) -> Tensor:
@@ -380,23 +395,28 @@ class ChunkPolicy(nn.Module):
         return loss, {"action_loss": float(loss.detach()), **metrics}
 
     @torch.no_grad()
-    def predict(self, batch: dict[str, Tensor], guidance_weight: float | None = None) -> Tensor:
+    def predict(
+        self,
+        batch: dict[str, Tensor],
+        guidance_weight: float | None = None,
+        guidance_mode: str | None = None,
+    ) -> Tensor:
         """Predicted chunk in raw robot units, [B, horizon, action_dim].
 
-        ``guidance_weight`` overrides the configured one for this call; 1.0 is
-        plain conditional sampling.
+        ``guidance_weight`` and ``guidance_mode`` override the configured ones
+        for this call; weight 1.0 is plain conditional sampling and ignores the
+        mode entirely, because the guided branch is never built.
         """
         weight = self.config.guidance_weight if guidance_weight is None else float(guidance_weight)
-        if weight != 1.0 and self.config.cond_dropout <= 0.0:
-            raise ValueError(
-                "This policy was trained without conditioning dropout, so its unconditional "
-                "branch is untrained and guidance would extrapolate from noise. Retrain with "
-                "--cond-dropout 0.1 or sample at guidance_weight=1.0."
-            )
+        mode = self.config.guidance_mode if guidance_mode is None else str(guidance_mode)
+        if weight != 1.0:
+            reason = self.config.guidance_unavailable_reason(mode)
+            if reason is not None:
+                raise ValueError(f"guidance_weight={weight} in mode {mode!r} {reason}")
         context = self.encode_context(batch)
         shape = (context.shape[0], self.config.horizon, self.config.action_dim)
         sampled = self.objective.sample(
-            self._decoder_fn(context, weight), shape, context.device, torch.float32
+            self._decoder_fn(context, weight, mode), shape, context.device, torch.float32
         )
         return self._to_absolute(sampled, batch)
 

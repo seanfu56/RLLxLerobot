@@ -35,8 +35,14 @@ from types import MappingProxyType
 from typing import Any, Protocol
 
 ACTION_KEYS = tuple([f"joint_{index}.pos" for index in range(1, 7)] + ["gripper.pos"])
+EEF_POSITION_KEYS = ("eef.x", "eef.y", "eef.z")
+EEF_ROTATION_KEYS = ("eef.rx", "eef.ry", "eef.rz")
+EEF_POSE_KEYS = (*EEF_POSITION_KEYS, *EEF_ROTATION_KEYS)
 OBSERVATION_PREFIX = "observation."
 OBSERVATION_COLUMNS = tuple(f"{OBSERVATION_PREFIX}{key}" for key in ACTION_KEYS)
+EEF_OBSERVATION_COLUMNS = tuple(
+    f"{OBSERVATION_PREFIX}{key}" for key in EEF_POSE_KEYS
+)
 CAMERA_KEY = "overhead"
 DEFAULT_STATIC_PATH = Path(__file__).resolve().parent / "static" / "live.jpg"
 
@@ -618,7 +624,19 @@ class _ActionSampler:
                         {
                             column: sample.observation[key]
                             for key, column in zip(
-                                ACTION_KEYS, OBSERVATION_COLUMNS, strict=True
+                                ACTION_KEYS,
+                                OBSERVATION_COLUMNS,
+                                strict=True,
+                            )
+                        }
+                    )
+                    row.update(
+                        {
+                            column: sample.observation.get(key)
+                            for key, column in zip(
+                                EEF_POSE_KEYS,
+                                EEF_OBSERVATION_COLUMNS,
+                                strict=True,
                             )
                         }
                     )
@@ -1386,6 +1404,7 @@ class TeleopRuntime:
                 "source_control_timestamp_s",
                 "observation_action_delta_ms",
                 *ACTION_KEYS,
+                *EEF_POSE_KEYS,
             ]
             frame_timestamps = draft.video.frame_timestamps
             if len(draft.actions) != len(frame_timestamps):
@@ -1424,7 +1443,17 @@ class TeleopRuntime:
                         **{
                             key: row[column]
                             for key, column in zip(
-                                ACTION_KEYS, OBSERVATION_COLUMNS, strict=True
+                                ACTION_KEYS,
+                                OBSERVATION_COLUMNS,
+                                strict=True,
+                            )
+                        },
+                        **{
+                            key: row.get(column)
+                            for key, column in zip(
+                                EEF_POSE_KEYS,
+                                EEF_OBSERVATION_COLUMNS,
+                                strict=True,
                             )
                         },
                     }

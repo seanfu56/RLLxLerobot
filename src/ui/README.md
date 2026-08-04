@@ -258,6 +258,45 @@ PYTHONPATH=src python -m unittest ui.tests.test_policy_runtime -v
 PYTHONPATH=src python -m unittest policy.tests.test_checkpoints -v
 ~~~
 
+## Take a camera snapshot
+
+`snapshot_app.py` photographs the camera view and writes the frame to disk. It
+is the one page here that touches no robot: no CAN bus, no leader, no LeRobot
+plugins, only OpenCV and Streamlit. Use it to produce a conditioning frame for
+the video models, a goal image for `goal_policy_app.py`, or a reference
+photograph of a scene layout that has to be rebuilt later.
+
+~~~bash
+bash scripts/9_snapshot_ui.sh          # http://127.0.0.1:8505
+PORT=8506 bash scripts/9_snapshot_ui.sh
+~~~
+
+Pick the device in the sidebar - `/dev/cam_*` udev aliases are listed first
+because they survive a replug - then **Start camera**. The live view is the same
+browser-side JPEG refresh the teleoperation page uses, so watching it triggers
+no Streamlit reruns. **Take snapshot** writes the frame that is on screen; the
+**Delay** selector next to it arms a countdown first, for when the operator has
+to be in front of the camera rather than at the keyboard.
+
+Files are named `{prefix}_{YYYYmmdd-HHMMSS-mmm}.{png,jpg}` under
+`outputs/snapshots` by default, and every saved still appears in the gallery at
+the bottom of the page with a download button. PNG is the default because these
+frames are fed to the video models, where a JPEG artefact in a conditioning
+frame is indistinguishable from something the model was asked to reproduce.
+
+`snapshot_camera.py` holds the camera in one background thread, shared by every
+browser session through `st.cache_resource`, so a second tab does not open a
+second handle to the device. That thread drains the capture continuously, which
+is what makes a snapshot the scene as it is now rather than whatever frame V4L2
+had queued. A camera can only be held by one process at a time: stop it here
+before starting the teleoperation or policy page against the same device.
+
+Run its mock suite without a camera:
+
+~~~bash
+PYTHONPATH=src python -m unittest ui.tests.test_snapshot_camera -v
+~~~
+
 ## Safety and failure policy
 
 - Safe disconnect first stops the control worker. Only after it has stopped
