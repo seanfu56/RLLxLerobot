@@ -119,13 +119,15 @@ class PolicySettings:
     # Goal frame for a --goal-conditioned checkpoint. Read in the hardware
     # process, so this is a path rather than an array.
     goal_image: Path | None = None
+    # Task text used by language-conditioned policies such as SmolVLA.
+    task: str = ""
     # ``joint`` preserves existing checkpoints. ``eef_ik`` interprets policy
     # actions as Cartesian pose targets and solves them to Piper joint targets.
     action_mode: str = "joint"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checkpoint", Path(self.checkpoint).expanduser())
-        if not self.checkpoint.is_file():
+        if not self.checkpoint.is_file() and not self.checkpoint.is_dir():
             raise ValueError(f"Checkpoint not found: {self.checkpoint}")
         if self.goal_image is not None:
             object.__setattr__(self, "goal_image", Path(self.goal_image).expanduser())
@@ -574,6 +576,20 @@ def _build_runner(settings: PolicySettings) -> Any:
     checkpoint and the plain one otherwise, and refuses a goal frame that has
     nowhere to go.
     """
+    if settings.checkpoint.is_dir() and (settings.checkpoint / "smolvla_local_config.json").is_file():
+        try:
+            from ui.smolvla_runtime import SmolVLARunner
+        except ModuleNotFoundError as exc:
+            if exc.name != "ui":
+                raise
+            from smolvla_runtime import SmolVLARunner
+        return SmolVLARunner(
+            settings.checkpoint,
+            device=settings.device,
+            action_steps=settings.action_steps,
+            task=settings.task,
+        )
+
     try:
         from policy.goal import load_runner
     except ModuleNotFoundError:

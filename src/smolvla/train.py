@@ -82,7 +82,7 @@ def main() -> None:
 
     try:
         from lerobot.configs.types import FeatureType, PolicyFeature
-        from lerobot.policies.smolvla import SmolVLAPolicy
+        from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
         from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
     except ImportError as exc:
         raise SystemExit("SmolVLA needs LeRobot with the smolvla extra installed") from exc
@@ -148,6 +148,7 @@ def main() -> None:
     (args.output_dir / "smolvla_local_config.json").write_text(json.dumps({
         "bundle": str(bundle.dir), "horizon": args.horizon,
         "n_action_steps": policy.config.n_action_steps,
+        "action_names": list(bundle.joint_names),
         "state_mean": state_mean.cpu().tolist(), "state_std": state_std.cpu().tolist(),
         "action_mean": action_mean.cpu().tolist(), "action_std": action_std.cpu().tolist(),
     }, indent=2), encoding="utf-8")

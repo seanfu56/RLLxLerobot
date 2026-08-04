@@ -98,7 +98,10 @@ class PiperIK:
             residual,
             seed_rad,
             bounds=(lower, upper),
-            max_nfev=60,
+            # A bounded 6-DOF solve can legitimately need more evaluations
+            # near a joint limit.  The final pose error is the meaningful
+            # acceptance criterion below, not scipy's termination status.
+            max_nfev=120,
             ftol=1e-6,
             xtol=1e-6,
             gtol=1e-6,
@@ -111,7 +114,11 @@ class PiperIK:
             abs(_angle_error_deg(float(pose[index]), target_values[index]))
             for index in range(3, 6)
         )
-        if not result.success or position_error_m > position_tolerance_m or rotation_error_deg > rotation_tolerance_deg:
+        # ``least_squares`` may report ``max_nfev`` even after it has found a
+        # usable solution.  Reject only targets that are actually outside the
+        # control tolerances; otherwise a harmless optimizer status would stop
+        # the rollout despite the robot already having a valid target.
+        if position_error_m > position_tolerance_m or rotation_error_deg > rotation_tolerance_deg:
             raise ValueError(
                 "EEF IK did not reach the target: "
                 f"position error={position_error_m * 1000.0:.1f} mm, "

@@ -93,7 +93,7 @@ except ModuleNotFoundError:
 UI_REFRESH_S = 0.2
 TELEMETRY_REFRESH_S = 1.0
 PREVIEW_REFRESH_S = 0.1
-DEFAULT_MODEL_ROOTS = f"models/simple {DEFAULT_MODEL_ROOT}"
+DEFAULT_MODEL_ROOTS = f"models/simple models/smolvla {DEFAULT_MODEL_ROOT}"
 KNOWN_CAMERA_GLOBS = ("/dev/cam_*", "/dev/video*")
 FOURCC_OPTIONS = ("Auto (same as CLI)", "MJPG", "YUYV")
 
@@ -303,22 +303,33 @@ def checkpoint_panel() -> PolicySettings | None:
     )
     device = st.selectbox("Device", ("cuda", "cpu"), index=0, disabled=driving)
     use_ema = st.checkbox("Use EMA weights", value=True, disabled=driving)
-    action_mode = st.radio(
-        "Policy action mode",
-        ("joint", "eef_ik"),
-        format_func=lambda value: (
-            "Joint targets"
-            if value == "joint"
-            else "EEF pose targets → numerical IK"
-        ),
-        disabled=driving,
-        help=(
-            "EEF IK requires a checkpoint trained with action columns "
-            "eef.x/eef.y/eef.z/eef.rx/eef.ry/eef.rz/gripper.pos. "
-            "Both absolute and delta EEF checkpoints are supported. Existing "
-            "joint-target checkpoints must use Joint targets."
-        ),
-    )
+    action_names = tuple(config.get("action_names") or ())
+    smolvla_eef = run.policy == "smolvla" and action_names[:3] == ("eef.x", "eef.y", "eef.z")
+    if run.policy == "smolvla":
+        action_mode = "eef_ik" if smolvla_eef else "joint"
+        st.info(
+            "SmolVLA outputs absolute EEF pose targets; the UI will convert them to Piper "
+            "joint commands with numerical IK."
+            if smolvla_eef
+            else "SmolVLA outputs absolute joint targets from this training bundle."
+        )
+    else:
+        action_mode = st.radio(
+            "Policy action mode",
+            ("joint", "eef_ik"),
+            format_func=lambda value: (
+                "Joint targets"
+                if value == "joint"
+                else "EEF pose targets → numerical IK"
+            ),
+            disabled=driving,
+            help=(
+                "EEF IK requires a checkpoint trained with action columns "
+                "eef.x/eef.y/eef.z/eef.rx/eef.ry/eef.rz/gripper.pos. "
+                "Both absolute and delta EEF checkpoints are supported. Existing "
+                "joint-target checkpoints must use Joint targets."
+            ),
+        )
 
     try:
         return PolicySettings(
@@ -327,6 +338,7 @@ def checkpoint_panel() -> PolicySettings | None:
             device=device,
             use_ema=use_ema,
             action_mode=action_mode,
+            task=st.session_state.get("_selected_run_task", ""),
         )
     except ValueError as exc:
         st.error(str(exc))

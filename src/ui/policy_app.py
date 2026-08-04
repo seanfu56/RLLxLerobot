@@ -63,7 +63,7 @@ UI_REFRESH_S = 0.2
 # Runs written by src/policy/train.py land under models/simple. Older sweeps sit
 # under models/sweeps; keeping it listed makes those runs visible even though
 # their weights can no longer be loaded.
-DEFAULT_MODEL_ROOTS = f"models/simple {DEFAULT_MODEL_ROOT}"
+DEFAULT_MODEL_ROOTS = f"models/simple models/smolvla {DEFAULT_MODEL_ROOT}"
 TELEMETRY_REFRESH_S = 1.0
 PREVIEW_REFRESH_S = 0.1
 KNOWN_CAMERA_GLOBS = ("/dev/cam_*", "/dev/video*")
@@ -211,7 +211,7 @@ def checkpoint_panel() -> PolicySettings | None:
     # metrics remain readable through sweeps/collect_results.py - but nothing in
     # the tree can build that architecture any more, so loading would only fail
     # later with a state-dict mismatch.
-    if run.policy not in ("simple", "?"):
+    if run.policy not in ("simple", "smolvla", "?"):
         st.error(
             f"{run.name} was trained by the DINOv2 transformer policy (`{run.policy}`), which "
             "has been removed. Its metrics are still readable, but the weights can no longer "
@@ -353,6 +353,7 @@ def checkpoint_panel() -> PolicySettings | None:
             device=device,
             use_ema=use_ema,
             goal_image=goal_image,
+            task=st.session_state.get("_selected_run_task", ""),
         )
     except ValueError as exc:
         st.error(str(exc))
