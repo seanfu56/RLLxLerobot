@@ -63,7 +63,6 @@ from cosmos.data import NUM_FRAMES, RESOLUTION
 from cosmos.runtime import (
     DEFAULT_ADAPTER,
     DEFAULT_FLOW_SHIFT,
-    DEFAULT_FPS,
     DEFAULT_GUIDANCE,
     DEFAULT_MODEL,
     DEFAULT_STEPS,
@@ -104,6 +103,35 @@ class GenerationService:
         self.runner = runner
         self.lock = threading.Lock()
         self.requests = 0
+        self._warned_fps: set[float] = set()
+
+    def resolve_fps(self, request: dict) -> float:
+        """The conditioning rate for one request, defaulting to the trained one.
+
+        FPS is not a playback preference: it scales the temporal component of
+        the vision tokens' mRoPE ids and is written into the prompt's duration
+        template, so asking for a rate the adapter was not trained at tells the
+        model the clip spans the wrong number of seconds. When one caption
+        covers several demonstrated motions that is enough on its own to make
+        the model always pick the one whose pace best fits, so an override is
+        worth saying out loud rather than accepting silently.
+        """
+        requested = request.get("fps")
+        if requested is None:
+            return self.runner.fps
+        fps = float(requested)
+        if fps <= 0:
+            raise ValueError(f"'fps' must be positive, got {fps}")
+        trained = self.runner.training_fps
+        if trained is not None and abs(fps - trained) > 0.5 and fps not in self._warned_fps:
+            self._warned_fps.add(fps)
+            LOGGER.warning(
+                "Request asked for %.2f FPS but the adapter was trained at %.2f; "
+                "the model will read the clip as %.1fs instead of %.1fs, which "
+                "biases which demonstrated motion it reproduces",
+                fps, trained, self.runner.num_frames / fps, self.runner.num_frames / trained,
+            )
+        return fps
 
     def generate(self, request: dict) -> dict:
         if "image" not in request:
@@ -113,7 +141,7 @@ class GenerationService:
             raise ValueError(f"'output' must be one of {OUTPUT_KINDS}, got {kind!r}")
 
         frame_bgr = decode_png(request["image"])
-        fps = float(request.get("fps", self.runner.fps))
+        fps = self.resolve_fps(request)
         started = time.perf_counter()
         # One GPU, one generation at a time. ThreadingHTTPServer would happily
         # run two forwards concurrently, which is slower and risks OOM.
@@ -131,10 +159,16 @@ class GenerationService:
             self.requests += 1
         elapsed = time.perf_counter() - started
 
+        guidance = request.get("guidance_scale")
         response = {
             "num_frames": len(frames),
             "resolution": self.runner.resolution,
+            # The rate the clip was conditioned at, which is also the rate it
+            # should be played back at for the motion to run at real speed.
             "fps": fps,
+            "guidance_scale": (
+                self.runner.guidance_scale if guidance is None else float(guidance)
+            ),
             "seconds": round(elapsed, 3),
             "output": kind,
         }
@@ -145,10 +179,13 @@ class GenerationService:
         elif kind == "frames":
             response["frames"] = [encode_png(frame) for frame in pil_frames_to_bgr(frames)]
         else:
-            from diffusers.utils import export_to_video
+            from cosmos.video_io import save_video
 
+            # Lossless, so a clip pulled off this endpoint is training data
+            # rather than a preview; see cosmos/video_io.py. Costs ~60x the
+            # bytes, which on a localhost socket is not the constraint.
             with tempfile.NamedTemporaryFile(suffix=".mp4") as handle:
-                export_to_video(frames, handle.name, fps=round(fps))
+                save_video(frames, handle.name, fps)
                 response["video"] = base64.b64encode(Path(handle.name).read_bytes()).decode("ascii")
         LOGGER.info("generate output=%s frames=%d in %.2fs", kind, len(frames), elapsed)
         return response
@@ -206,7 +243,8 @@ class CosmosRequestHandler(BaseHTTPRequestHandler):
 
         try:
             self._respond(200, self.service.generate(request))
-        except (ValueError, KeyError, FileNotFoundError) as error:
+        except (ValueError, TypeError, KeyError, FileNotFoundError) as error:
+            # TypeError covers a field of the wrong JSON type, e.g. "fps": [12].
             self._respond(400, {"error": str(error)})
         except Exception as error:  # keep the server up when one request fails
             full_traceback = traceback.format_exc()
@@ -239,7 +277,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     model.add_argument("--device", default="cuda")
     model.add_argument("--resolution", type=int, default=RESOLUTION)
     model.add_argument("--num-frames", type=int, default=NUM_FRAMES)
-    model.add_argument("--fps", type=float, default=DEFAULT_FPS)
+    model.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Defaults to the retimed clip rate the adapter was trained at",
+    )
     model.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     model.add_argument("--guidance-scale", type=float, default=DEFAULT_GUIDANCE)
     model.add_argument("--flow-shift", type=float, default=DEFAULT_FLOW_SHIFT)

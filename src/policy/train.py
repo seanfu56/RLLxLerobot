@@ -221,7 +221,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                       default=GOAL_ONLY_DEFAULTS["goal_selection"],
                       help="uniform4: sample --goal-frames evenly across the episode and take "
                            "--goal-frame-index of them, the same rule src/diffusion generates "
-                           "video under. tail: a picture of the finished task")
+                           "video under. tail: a picture of the finished task. future_uniform: "
+                           "draw uniformly between current+horizon and the final frame")
     goal.add_argument("--goal-frames", type=int, default=GOAL_ONLY_DEFAULTS["goal_frames"],
                       help="Frames sampled across the episode under --goal-selection uniform4")
     goal.add_argument("--goal-frame-index", type=int,
@@ -562,12 +563,16 @@ def main(argv: list[str] | None = None) -> None:
     print(f"guidance     cond dropout {args.cond_dropout} | weight {args.guidance_weight}"
           f"{' (plain conditional)' if args.guidance_weight == 1.0 else ''}")
     if args.goal_conditioned:
-        goal_rule = (
-            f"frame {args.goal_frame_index} of {args.goal_frames} sampled evenly"
-            if args.goal_selection == "uniform4"
-            else "the episode's last frame"
-        )
-        print(f"goal         {goal_rule}, ending in the last {args.goal_window} frames | "
+        if args.goal_selection == "uniform4":
+            goal_rule = (
+                f"frame {args.goal_frame_index} of {args.goal_frames} sampled evenly, "
+                f"ending in the last {args.goal_window} frames"
+            )
+        elif args.goal_selection == "future_uniform":
+            goal_rule = "uniformly after the action chunk through the final frame"
+        else:
+            goal_rule = f"the episode's last {args.goal_window} frames"
+        print(f"goal         {goal_rule} | "
               f"dropout {args.goal_dropout}"
               f"{' (needs a goal at inference)' if args.goal_dropout == 0.0 else ''}")
     print(f"augment      crop >= {args.crop_scale if args.augment else 1.0}, "

@@ -144,6 +144,38 @@ class GoalDatasetTests(unittest.TestCase):
         self.assertTrue(drawn <= reachable)
         self.assertGreater(len(drawn), 1)
 
+    def test_future_uniform_goals_start_after_the_action_chunk(self) -> None:
+        dataset = self._dataset(goal_selection="future_uniform")
+        episode = self.bundle.episodes[0]
+        # Offset 10 has actions at 10..17, so valid goals are 18..29.
+        reachable = {
+            bytes(np.array(self.bundle.frames[episode.shard][episode.start + offset]).data)
+            for offset in range(18, 30)
+        }
+        drawn = {
+            bytes(dataset[10]["goal_image"].permute(1, 2, 0).contiguous().numpy().data)
+            for _ in range(60)
+        }
+        self.assertTrue(drawn <= reachable)
+        self.assertGreater(len(drawn), 1)
+
+    def test_future_uniform_removes_samples_without_a_post_chunk_goal(self) -> None:
+        dataset = self._dataset(goal_selection="future_uniform")
+        # A 30-frame episode and horizon 8 permit offsets 0..21 inclusive.
+        self.assertEqual(len(dataset), 2 * 22)
+        for episode_index, offset in dataset.index:
+            episode = dataset.episodes[episode_index]
+            self.assertLessEqual(offset + dataset.horizon, len(episode) - 1)
+
+    def test_future_uniform_validation_uses_the_final_frame(self) -> None:
+        dataset = self._dataset(goal_selection="future_uniform", random_goal=False)
+        expected = np.array(self.bundle.frames[0][self.bundle.episodes[0].end - 1])
+        # Check the first and last valid sample of the first episode.
+        for item in (0, 21):
+            np.testing.assert_array_equal(
+                dataset[item]["goal_image"].permute(1, 2, 0).numpy(), expected
+            )
+
     def test_the_uniform_rule_is_the_one_the_video_model_generates_under(self) -> None:
         """src/diffusion generates frames 1-3 of four; the goal is its frame 3.
 
@@ -155,7 +187,7 @@ class GoalDatasetTests(unittest.TestCase):
         for last in range(3, 400):
             self.assertEqual(tuple(uniform_frame_offsets(last, 4)), four_frame_indices(last + 1, last))
 
-    def test_the_goal_selection_rule_must_be_one_of_the_two(self) -> None:
+    def test_the_goal_selection_rule_must_be_supported(self) -> None:
         with self.assertRaises(ValueError):
             self._dataset(goal_selection="whatever")
 
@@ -481,6 +513,13 @@ class GoalArgumentTests(unittest.TestCase):
         args = parse_args(["--bundle", "tiny", "--goal-conditioned"])
         self.assertEqual(args.goal_selection, "uniform4")
         self.assertEqual((args.goal_frames, args.goal_frame_index), (4, 2))
+
+    def test_future_uniform_is_an_accepted_goal_selection(self) -> None:
+        args = parse_args([
+            "--bundle", "tiny", "--goal-conditioned",
+            "--goal-selection", "future_uniform",
+        ])
+        self.assertEqual(args.goal_selection, "future_uniform")
 
     def test_goal_flags_without_goal_conditioning_are_flagged(self) -> None:
         from policy.train import warn_about_ignored_flags

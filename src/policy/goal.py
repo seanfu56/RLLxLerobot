@@ -28,13 +28,15 @@ default is the one that matches what a video model actually hands you:
     One frame drawn uniformly from the last ``--goal-window`` frames, i.e. a
     picture of the finished task. Use it when the goal is a photograph of the
     desired end state rather than something a video model produced.
+``future_uniform``
+    One frame drawn uniformly from ``current + horizon`` through the episode's
+    true final frame. The full target action chunk therefore lies before the
+    goal. Samples too close to the end to satisfy that constraint are omitted.
 
-Neither rule needs anything in the data to be labelled; the goal is *hindsight*,
-read off the demonstration that was already recorded. Both redraw every time a
-sample is visited so the policy sees a spread of goals rather than keying on one
-exact pixel arrangement, and both pin the endpoint to the true final frame at
-validation, because a goal that moves between evaluations makes ``val_loss``
-noisy and ``val_loss`` is what selects ``best.pt``.
+No rule needs anything in the data to be labelled; the goal is *hindsight*, read
+off the demonstration that was already recorded. Training redraws the goal every
+time a sample is visited, while validation uses a deterministic goal so
+``val_loss`` remains comparable between evaluations.
 
 **Why bother on a single-task bundle.** Mostly you should not expect much. Every
 episode of ``pick-can-m1`` ends in nearly the same picture, so the goal carries
@@ -138,10 +140,10 @@ def uniform_frame_offsets(last_offset: int, count: int = DEFAULT_GOAL_FRAMES) ->
 class GoalChunkDataset(ChunkDataset):
     """``ChunkDataset`` plus a ``goal_image`` (3, H, W) drawn from the episode.
 
-    ``goal_selection`` picks which frame - see the module docstring. Both rules
-    treat the episode's last ``goal_window`` frames as interchangeable endings
-    (the arm is still settling over the final half second) and draw from them,
-    which is where the randomness the caller asked for comes from.
+    ``goal_selection`` picks which frame - see the module docstring. ``uniform4``
+    and ``tail`` treat the episode's last ``goal_window`` frames as
+    interchangeable endings. ``future_uniform`` instead draws between the end
+    of this sample's action chunk and the episode's true final frame.
 
     ``random_goal`` is the train/validation difference: validation pins the
     endpoint to the true final frame, so the goal is the same picture at every
@@ -182,6 +184,22 @@ class GoalChunkDataset(ChunkDataset):
         self.goal_frame_index = int(goal_frame_index)
         self.random_goal = bool(random_goal)
 
+        if self.goal_selection == "future_uniform":
+            # Actions for an offset cover [offset, offset + horizon - 1], so the
+            # earliest valid goal is offset + horizon. Do not clamp late samples
+            # to the final frame: that would silently put their goal inside the
+            # chunk and break the guarantee this selection mode exists to make.
+            self.index = [
+                (episode_index, offset)
+                for episode_index, offset in self.index
+                if offset + self.horizon <= len(self.episodes[episode_index]) - 1
+            ]
+            if not self.index:
+                raise ValueError(
+                    "goal_selection='future_uniform' found no samples with a goal after the "
+                    f"{self.horizon}-step action chunk; use longer episodes or a shorter horizon"
+                )
+
     def last_offset(self, episode: EpisodeRef, rng: np.random.Generator) -> int:
         """Which frame counts as "the end" of this episode for this draw."""
         start, end = goal_offset_range(len(episode), self.goal_window)
@@ -189,7 +207,19 @@ class GoalChunkDataset(ChunkDataset):
             return end - 1
         return int(rng.integers(start, end))
 
-    def goal_offset(self, episode: EpisodeRef, rng: np.random.Generator) -> int:
+    def goal_offset(
+        self, episode: EpisodeRef, offset: int, rng: np.random.Generator
+    ) -> int:
+        if self.goal_selection == "future_uniform":
+            first = offset + self.horizon
+            end = len(episode)
+            if first >= end:
+                raise ValueError(
+                    f"No future goal after offset {offset} and horizon {self.horizon} "
+                    f"in an episode of length {len(episode)}"
+                )
+            return end - 1 if not self.random_goal else int(rng.integers(first, end))
+
         last = self.last_offset(episode, rng)
         if self.goal_selection == "tail":
             return last
@@ -204,7 +234,7 @@ class GoalChunkDataset(ChunkDataset):
     ) -> dict[str, torch.Tensor]:
         frames = self.bundle.frames[episode.shard]
         # np.array copies: the shard is a read-only memmap shared by every worker.
-        frame = np.array(frames[episode.start + self.goal_offset(episode, rng)])
+        frame = np.array(frames[episode.start + self.goal_offset(episode, offset, rng)])
         if self.augment:
             frame, _ = augment_frame(frame, rng, self.crop_scale, self.color_jitter, crop_box)
         return {"goal_image": torch.from_numpy(frame).permute(2, 0, 1).contiguous()}

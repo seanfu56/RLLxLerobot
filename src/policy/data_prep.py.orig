@@ -8,8 +8,8 @@ directory is decoded exactly once into a shard:
 
     <output-root>/_shards/<task>/
         frames.npy      uint8  [N, S, S, 3]  RGB, center cropped then resized
-        state.npy       float32 [N, 7]       measured EEF pose + gripper
-        action.npy      float32 [N, 7]       commanded EEF pose + gripper target
+        state.npy       float32 [N, 7]       measured joint state
+        action.npy      float32 [N, 7]       commanded joint target
         shard.json                           episode boundaries + metadata
 
 A *bundle* is what training consumes.  It is a manifest that points at one or
@@ -38,13 +38,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Policy state/action representation. Position is in metres, EEF Euler rotation
-# is in degrees (as recorded by the Piper logger), and gripper position is in mm.
-# Keep JOINT_NAMES as a compatibility alias: older policy/data tests and tools
-# import this symbol, while the generated metadata now correctly advertises EEF
-# fields rather than joint angles.
-EEF_NAMES = ("eef.x", "eef.y", "eef.z", "eef.rx", "eef.ry", "eef.rz", "gripper.pos")
-JOINT_NAMES = EEF_NAMES
+JOINT_NAMES = tuple([f"joint_{index}.pos" for index in range(1, 7)] + ["gripper.pos"])
 
 # Bundles that span more than one task directory. Anything not listed here is
 # resolved against --raw-root as a task directory of the same name, so a new
@@ -52,9 +46,7 @@ JOINT_NAMES = EEF_NAMES
 # does. Sources named here are checked against the disk when they are requested,
 # never at import time, so a spec can outlive the data it refers to.
 BUNDLE_SPECS: dict[str, tuple[str, ...]] = {
-    "pick-can-all": ("pick-can-1", "pick-can-2"),
-    "pick-scissors-all": ("pick-scissors-1", "pick-scissors-2"),
-    "move-bar-all": ("move-bar-1", "move-bar-2"),
+    "pick-can-all": ("pick-can-m1", "pick-can-m2"),
 }
 
 DEFAULT_IMAGE_SIZE = 224
@@ -162,19 +154,11 @@ def load_episode(episode_path: Path) -> tuple[np.ndarray, np.ndarray, dict]:
         if action_row.get("source_control_sequence") != observation_row.get("source_control_sequence"):
             raise ValueError(f"{episode_path} action/observation control sequences differ at row {index}")
 
-    missing = {
-        kind: [name for name in EEF_NAMES if name not in rows[0]]
-        for kind, rows in (("actions", actions), ("observations", observations))
-    }
-    missing = {kind: names for kind, names in missing.items() if names}
-    if missing:
-        raise ValueError(f"{episode_path} is missing EEF columns: {missing}")
-
     state = np.asarray(
-        [[float(row[name]) for name in EEF_NAMES] for row in observations], dtype=np.float32
+        [[float(row[name]) for name in JOINT_NAMES] for row in observations], dtype=np.float32
     )
     action = np.asarray(
-        [[float(row[name]) for name in EEF_NAMES] for row in actions], dtype=np.float32
+        [[float(row[name]) for name in JOINT_NAMES] for row in actions], dtype=np.float32
     )
     if not np.isfinite(state).all() or not np.isfinite(action).all():
         raise ValueError(f"{episode_path} contains non-finite state/action values")
@@ -275,11 +259,7 @@ def build_shard(source_root: Path, shard_dir: Path, image_size: int, force: bool
                 "raw_root": str(source_root),
                 "image_size": image_size,
                 "fps": fps,
-                "joint_names": list(EEF_NAMES),
-                "state_names": list(EEF_NAMES),
-                "action_names": list(EEF_NAMES),
-                "state_units": ["m", "m", "m", "deg", "deg", "deg", "mm"],
-                "action_units": ["m", "m", "m", "deg", "deg", "deg", "mm"],
+                "joint_names": list(JOINT_NAMES),
                 "num_frames": total_frames,
                 "num_episodes": len(episodes),
                 "episodes": episodes,
@@ -317,11 +297,7 @@ def write_bundle(bundle_dir: Path, name: str, shard_dirs: list[Path]) -> None:
         "shard_paths_relative_to": "bundle parent directory",
         "image_size": image_sizes.pop(),
         "fps": fps_values.pop(),
-        "joint_names": list(EEF_NAMES),
-        "state_names": list(EEF_NAMES),
-        "action_names": list(EEF_NAMES),
-        "state_units": ["m", "m", "m", "deg", "deg", "deg", "mm"],
-        "action_units": ["m", "m", "m", "deg", "deg", "deg", "mm"],
+        "joint_names": list(JOINT_NAMES),
         "num_frames": int(sum(meta["num_frames"] for meta in shard_metas)),
         "num_episodes": int(sum(meta["num_episodes"] for meta in shard_metas)),
         "tasks": sorted({episode["task"] for meta in shard_metas for episode in meta["episodes"]}),

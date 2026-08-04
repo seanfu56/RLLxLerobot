@@ -165,14 +165,14 @@ python src/policy/train.py --bundle pick-can-all --run-name G_pick_can \
     --goal-conditioned --goal-dropout 0.1
 ```
 
-**Which frame is the goal.** One drawn uniformly from the last `--goal-window`
-frames (10 by default) of the episode the sample came from, redrawn each epoch.
-Not the final frame alone: the arm is still settling over the last half second,
-so the tail is a set of pictures that all mean "done", and training against a
-fresh draw stops the policy keying on one exact pixel arrangement. Nothing needs
-labelling — the goal is *hindsight*, read off demonstrations you already have.
-Validation pins it to the final frame instead, because a goal that moves between
-evaluations makes `val_loss` noisy and `val_loss` selects `best.pt`.
+**Which frame is the goal.** `--goal-selection` supports three rules. `uniform4`
+takes the third of four frames spread across the episode, matching the generated
+video pipeline. `tail` draws from the final `--goal-window` frames.
+`future_uniform` draws uniformly from `current + horizon` through the true final
+frame, and removes late samples that cannot put their whole target action chunk
+before the goal. Nothing needs labelling — every rule reads hindsight goals from
+the demonstrations. Validation makes the selected goal deterministic so a moving
+goal does not add noise to checkpoint comparison.
 
 Under augmentation the goal shares the observation stack's crop box, for the
 same reason the two observation frames do: the camera is static, so cropping the

@@ -202,13 +202,46 @@ Why seeds matter: the rectified Flow-Matching model transports an initial
 Gaussian latent through a deterministic ODE. Reusing one seed therefore
 reuses one trajectory; it cannot expose the conditional distribution's mode
 coverage. Each variant now starts from an independent Gaussian latent.
-Classifier-free guidance is the second diversity control: stronger guidance
-usually improves prompt adherence at the cost of mode coverage. The official
-Cosmos value remains the default (`--guidance-scale 6`); try
-`--guidance-scale 3` when diversity matters more, and compare both settings
-with the same explicit seed sequence. `--flow-shift` changes which noise levels
-the solver visits, not the random trajectory, so it remains at the official
-Cosmos value of 10.
+
+### What decides which mode you get
+
+One caption covers both recording modes, and the two modes' first frames are
+indistinguishable (mean absolute difference across modes 0.0103, versus 0.0105
+and 0.0101 within them), so nothing in the conditioning says which motion to
+produce. The initial latent decides it, and because `generate` seeds the noise
+from the seed alone, **the seed is the unit of variation, not the conditioning
+frame** — the same seed lands in the same basin for every held-out episode.
+Estimating mode coverage therefore needs many seeds, not many episodes.
+
+Measured on `pick-can-all`, 320 clips, 32 seeds x 2 held-out episodes,
+classified against the 60 real episodes by a motion signature that scores 100%
+leave-one-out:
+
+| `--guidance-scale` | conditioning FPS | mode-1 (top-down) rate |
+| ------------------ | ---------------- | ---------------------- |
+| 1                  | 20.0             | 0.0%  (0/64)           |
+| 1                  | 12.78 (trained)  | 21.9% (14/64)          |
+| 2                  | 12.78            | 21.9% (14/64)          |
+| 3                  | 12.78            | 23.4% (15/64)          |
+| 6                  | 12.78            | 20.3% (13/64)          |
+
+Two things follow. **The conditioning FPS is decisive**: it scales the temporal
+component of the vision tokens' mRoPE ids (`fps=20` packs the 24 latent frames
+into a span of 27.6 instead of 43.2) and is written into the prompt's duration
+template ("4.7 seconds long and is of 20 FPS" instead of "7.3 seconds"). Asking
+for a rate the adapter never saw tells the model the clip covers the wrong
+duration, and the faster of the two motions wins every time. This is why `--fps`
+now defaults to the rate recovered from the run rather than the camera's 20.
+
+**Classifier-free guidance is inert here**, 1 through 6, contrary to the usual
+diversity/adherence tradeoff — so the official Cosmos value of 6 remains the
+default. `--flow-shift` was also inert across 5 and 10 (six paired settings,
+identical rates) and stays at 10. Neither was measured for visual quality, only
+for which motion appears.
+
+The remaining gap matters: ~22% against the 50% the training data contains. That
+residual skew is a property of the fine-tuned velocity field, not of the
+sampler, and closing it needs a training-side change.
 
 ### DiverseFlow inference
 

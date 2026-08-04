@@ -48,7 +48,9 @@ if __package__ in (None, ""):
         DEFAULT_NEGATIVE,
         DEFAULT_STEPS,
         CosmosRunner,
+        training_clip_fps,
     )
+    from cosmos.video_io import save_video
 else:
     from .data import (
         NUM_FRAMES,
@@ -70,7 +72,9 @@ else:
         DEFAULT_NEGATIVE,
         DEFAULT_STEPS,
         CosmosRunner,
+        training_clip_fps,
     )
+    from .video_io import save_video
 
 LOGGER = logging.getLogger("cosmos3-sample")
 DEFAULT_SAMPLES_PER_CONDITION = 4
@@ -142,7 +146,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     generation = parser.add_argument_group("generation")
     generation.add_argument("--resolution", type=int, default=RESOLUTION)
     generation.add_argument("--num-frames", type=int, default=NUM_FRAMES)
-    generation.add_argument("--clip-mode", choices=("window", "episode"), default="window")
+    generation.add_argument(
+        "--clip-mode",
+        choices=("window", "episode"),
+        default="episode",
+        help=(
+            "Must match training. Under 'window' the held-out condition is the centre "
+            "frame of the episode at the native 20 FPS, which is neither the first frame "
+            "nor the retimed rate the model was trained on"
+        ),
+    )
     generation.add_argument("--fps", type=float, default=None, help="Defaults to the clip's own FPS")
     generation.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="Denoising steps")
     generation.add_argument(
@@ -299,7 +312,13 @@ def build_conditions(args) -> list[dict]:
                     "pass --caption when sampling external images"
                 )
             caption = next(iter(caption_table.values()))
-        fps = args.fps if args.fps is not None else DEFAULT_FPS
+        # External images carry no episode to read a rate off, so fall back to
+        # what the adapter was trained at rather than the raw recording rate.
+        fps = args.fps
+        if fps is None and args.adapter:
+            fps = training_clip_fps(args.adapter)
+        if fps is None:
+            fps = DEFAULT_FPS
         conditions = []
         for path in paths:
             with Image.open(path) as source:
@@ -357,8 +376,6 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     conditions = build_conditions(args)
-
-    from diffusers.utils import export_to_video
 
     adapter = args.adapter.strip() if args.adapter else ""
     runner = CosmosRunner(
@@ -474,14 +491,12 @@ def main(argv: list[str] | None = None) -> None:
             target = output_dir / (
                 f"{condition['name']}_{suffix}{sampler_suffix}_seed{seed}.mp4"
             )
-            export_to_video(frames, str(target), fps=round(condition["fps"]))
+            save_video(frames, target, condition["fps"])
             LOGGER.info("Wrote %s", target)
 
         if condition["reference"] is not None and not args.no_reference:
             reference = output_dir / f"{condition['name']}_reference.mp4"
-            # Pass PIL frames, not arrays: export_to_video rescales ndarray
-            # input by 255, which would overflow already-uint8 frames.
-            export_to_video(condition["reference"], str(reference), fps=round(condition["fps"]))
+            save_video(condition["reference"], reference, condition["fps"])
             LOGGER.info("Wrote %s", reference)
 
 

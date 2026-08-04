@@ -236,6 +236,11 @@ def checkpoint_panel() -> PolicySettings | None:
             f"🎯 Trained on frame {frame_index} of {frames} sampled evenly across each episode - "
             "the same frame the video model below generates."
         )
+    elif selection == "future_uniform":
+        st.caption(
+            "🎯 Trained with a goal drawn uniformly after the target action chunk through the "
+            "episode's final frame. Choose a generated frame that is visibly beyond the next chunk."
+        )
     else:
         st.caption(
             f"🎯 Trained on the episode's last frames (goal-selection `{selection}`). This page "
@@ -594,7 +599,8 @@ def goal_panel(policy: PolicyInfo | None) -> None:
             st.session_state["_goal_frame_index"] = video.goal_index
             st.rerun()
         except Exception as exc:
-            st.error(f"Generation failed: {exc}")
+            st.error("Generation failed. Complete traceback:")
+            st.code(str(exc), language=None, wrap_lines=True)
     if clear_column.button("🗑 Clear", width="stretch", disabled=driving):
         st.session_state.pop("_goal_video", None)
         try:

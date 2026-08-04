@@ -31,6 +31,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -1835,8 +1836,8 @@ def _runtime_process_main(connection: Any) -> None:
                     connection.send(
                         (request_id, "ok", _snapshot_for_ipc(runtime.get_snapshot()))
                     )
-                except BaseException as exc:
-                    connection.send((request_id, "error", f"{type(exc).__name__}: {exc}"))
+                except BaseException:
+                    connection.send((request_id, "error", traceback.format_exc()))
                 return
             if operation not in _PROCESS_OPERATIONS:
                 connection.send(
@@ -1848,8 +1849,8 @@ def _runtime_process_main(connection: Any) -> None:
                 if isinstance(result, PolicySnapshot):
                     result = _snapshot_for_ipc(result)
                 connection.send((request_id, "ok", result))
-            except BaseException as exc:
-                connection.send((request_id, "error", f"{type(exc).__name__}: {exc}"))
+            except BaseException:
+                connection.send((request_id, "error", traceback.format_exc()))
     except (EOFError, BrokenPipeError):
         pass
     finally:

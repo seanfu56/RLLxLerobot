@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import statistics
 import time
 from pathlib import Path
 
@@ -35,9 +36,9 @@ if __package__ in (None, ""):
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from cosmos.data import NUM_FRAMES, RESOLUTION, check_geometry, preprocess_frame
+    from cosmos.data import NUM_FRAMES, RESOLUTION, check_geometry, load_episodes, preprocess_frame
 else:
-    from .data import NUM_FRAMES, RESOLUTION, check_geometry, preprocess_frame
+    from .data import NUM_FRAMES, RESOLUTION, check_geometry, load_episodes, preprocess_frame
 
 LOGGER = logging.getLogger("cosmos3-runtime")
 
@@ -45,11 +46,47 @@ DEFAULT_MODEL = "nvidia/Cosmos3-Nano"
 DEFAULT_ADAPTER = "models/cosmos3_nano_lora/pick-can-all/adapter"
 DEFAULT_CAPTIONS = Path(__file__).resolve().parent / "captions.json"
 DEFAULT_NEGATIVE = "blurry, distorted, low quality, static, jittery, warped geometry"
+# The rate the camera recorded at. Only correct for `--clip-mode window`; an
+# adapter trained in `episode` mode saw retimed clips, so prefer the rate
+# `training_clip_fps` recovers from the run and treat this as the last resort.
 DEFAULT_FPS = 20.0
 DEFAULT_STEPS = 35
 DEFAULT_GUIDANCE = 6.0
 DEFAULT_FLOW_SHIFT = 10.0
 DEFAULT_TASK = "pick up can"
+
+
+def training_clip_fps(adapter: str | Path) -> float | None:
+    """The clip FPS an adapter was trained at, recovered from its run directory.
+
+    ``--clip-mode episode`` retimes every recording onto ``--num-frames``, so the
+    rate the model was conditioned at is *not* the 20 FPS the camera recorded.
+    It is a per-bundle value -- 8.6 for ``move-bar-all``, 12.8 for
+    ``pick-can-all`` -- and conditioning at the wrong rate tells the model the
+    clip spans the wrong duration, which measurably biases which of several
+    demonstrated motions it reproduces. Reading it back from the run keeps
+    inference from silently drifting away from training.
+
+    Returns ``None`` when the run cannot be inspected -- no ``train_args.json``,
+    a bundle that has moved, or a run trained in ``window`` mode -- leaving the
+    caller to fall back to ``DEFAULT_FPS``.
+    """
+    args_path = Path(adapter).expanduser().resolve().parent / "train_args.json"
+    if not args_path.is_file():
+        return None
+    try:
+        # train.py stringifies every value, so num_frames arrives as "93".
+        recorded = json.loads(args_path.read_text(encoding="utf-8"))
+        if str(recorded.get("clip_mode")) != "episode":
+            return None
+        num_frames = int(recorded["num_frames"])
+        episodes = load_episodes(recorded["bundle"])
+    except (OSError, ValueError, KeyError) as error:
+        LOGGER.warning("Could not recover the training clip FPS from %s: %s", args_path, error)
+        return None
+    return statistics.median(
+        num_frames * episode.fps / episode.frames for episode in episodes
+    )
 
 
 def default_prompt(captions_path: str | Path = DEFAULT_CAPTIONS, task=DEFAULT_TASK) -> str:
@@ -100,7 +137,7 @@ class CosmosRunner:
         device: str = "cuda",
         resolution: int = RESOLUTION,
         num_frames: int = NUM_FRAMES,
-        fps: float = DEFAULT_FPS,
+        fps: float | None = None,
         steps: int = DEFAULT_STEPS,
         guidance_scale: float = DEFAULT_GUIDANCE,
         flow_shift: float = DEFAULT_FLOW_SHIFT,
@@ -112,8 +149,19 @@ class CosmosRunner:
         check_geometry(resolution, num_frames)
         self.resolution = int(resolution)
         self.num_frames = int(num_frames)
-        self.fps = float(fps)
+        # Kept even when an explicit rate overrides it, so callers can see how
+        # far they have moved from the rate the model was conditioned at.
+        self.training_fps = training_clip_fps(adapter) if adapter else None
+        resolved_fps = fps if fps is not None else self.training_fps
+        if resolved_fps is None:
+            resolved_fps = DEFAULT_FPS
+            LOGGER.warning(
+                "Falling back to %.1f FPS; an adapter trained in episode mode was "
+                "conditioned at a lower retimed rate", DEFAULT_FPS
+            )
+        self.fps = float(resolved_fps)
         self.steps = int(steps)
+        self.flow_shift = float(flow_shift)
         self.guidance_scale = float(guidance_scale)
         self.negative_prompt = negative_prompt
         self.prompt = prompt if prompt is not None else default_prompt()
@@ -163,8 +211,12 @@ class CosmosRunner:
             "resolution": self.resolution,
             "num_frames": self.num_frames,
             "fps": self.fps,
+            # None when the run could not be inspected; a client comparing the
+            # two can tell a deliberate override from a silent drift.
+            "training_fps": self.training_fps,
             "steps": self.steps,
             "guidance_scale": self.guidance_scale,
+            "flow_shift": self.flow_shift,
             "load_seconds": round(self.load_seconds, 2),
         }
 

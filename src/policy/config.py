@@ -31,7 +31,7 @@ NORM_MODES = ("meanstd", "minmax", "identity")
 # Which frame of an episode becomes the goal; ``policy.goal`` implements both
 # and re-exports this. It lives here because the config is the leaf module -
 # policy.goal imports policy.config, not the other way round.
-GOAL_SELECTIONS = ("uniform4", "tail")
+GOAL_SELECTIONS = ("uniform4", "tail", "future_uniform")
 
 __all__ = [
     "ACTION_REPRS", "BETA_SCHEDULES", "DELTA_MODES", "FLOW_TIME_SAMPLINGS", "GOAL_SELECTIONS",
@@ -100,6 +100,9 @@ class PolicyConfig:
     # model hands over at inference is the kind of picture training used.
     # "tail" is the older rule: a picture of the finished task. In both cases
     # the episode's end is drawn from its last ``goal_window`` frames.
+    # "future_uniform" draws uniformly from the first frame after the action
+    # chunk through the true final frame. Samples without that much future are
+    # removed by GoalChunkDataset.
     goal_conditioned: bool = False
     goal_selection: str = "uniform4"
     goal_frames: int = 4
