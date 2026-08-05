@@ -60,6 +60,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-freq", type=int, default=100)
     p.add_argument("--eval-freq", type=int, default=500)
     p.add_argument("--eval-batches", type=int, default=32)
+    p.add_argument("--persistent-workers", action="store_true", default=True,
+                   help="Keep data workers alive between epochs (default: enabled)")
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=1000)
     p.add_argument("--task-prefix", default="")
@@ -99,9 +101,11 @@ def main() -> None:
     train_data = SmolVLADataset(bundle, train_eps, **dataset_kwargs)
     val_data = SmolVLADataset(bundle, val_eps, random_goal=False, **dataset_kwargs)
     loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, pin_memory=True, drop_last=True)
+                        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                        persistent_workers=args.num_workers > 0)
     val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True, drop_last=False)
+                            num_workers=args.num_workers, pin_memory=True, drop_last=False,
+                            persistent_workers=args.num_workers > 0)
 
     try:
         from lerobot.configs.types import FeatureType, PolicyFeature
@@ -129,6 +133,7 @@ def main() -> None:
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     policy.to(device)
     tokenizer = policy.model.vlm_with_expert.processor.tokenizer
+    token_cache: dict[str, dict[str, torch.Tensor]] = {}
 
     # Bundle-level aggregate stats are not sufficient after an episode split;
     # calculate training-only mean/std to avoid leaking validation trajectories.
@@ -152,10 +157,21 @@ def main() -> None:
 
     def prepare_batch(batch: dict) -> dict:
         texts = batch.pop("task")
-        encoded = tokenizer(list(texts), padding=True, truncation=True,
-                            max_length=policy.config.tokenizer_max_length, return_tensors="pt")
-        batch[OBS_LANGUAGE_TOKENS] = encoded.input_ids
-        batch[OBS_LANGUAGE_ATTENTION_MASK] = encoded.attention_mask.bool()
+        for text in set(texts):
+            if text not in token_cache:
+                encoded = tokenizer([text], padding=True, truncation=True,
+                                    max_length=policy.config.tokenizer_max_length,
+                                    return_tensors="pt")
+                token_cache[text] = {
+                    "tokens": encoded.input_ids,
+                    "mask": encoded.attention_mask.bool(),
+                }
+        batch[OBS_LANGUAGE_TOKENS] = torch.cat(
+            [token_cache[text]["tokens"] for text in texts], dim=0
+        )
+        batch[OBS_LANGUAGE_ATTENTION_MASK] = torch.cat(
+            [token_cache[text]["mask"] for text in texts], dim=0
+        )
         batch["observation.state"] = (batch["observation.state"].to(device) - state_mean) / state_std
         batch["action"] = (batch["action"].to(device) - action_mean) / action_std
         return {
