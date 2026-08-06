@@ -179,6 +179,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                       help="Keep BatchNorm in the ResNet; unreliable at these batch sizes and under EMA")
     arch.add_argument("--no-proprio", dest="use_proprio", action="store_false",
                       help="Condition on images only")
+    arch.add_argument("--no-vision", dest="use_vision", action="store_false",
+                      help="Condition on Piper state only; do not encode camera frames")
     arch.add_argument("--no-film-scale", dest="use_film_scale_modulation", action="store_false",
                       help="FiLM bias only, no scale")
 
@@ -326,6 +328,7 @@ def build_config(args: argparse.Namespace, bundle: Bundle, stats: dict) -> Polic
         goal_window=args.goal_window,
         goal_dropout=args.goal_dropout,
         use_proprio=args.use_proprio,
+        use_vision=args.use_vision,
         cond_dropout=args.cond_dropout,
         guidance_weight=args.guidance_weight,
         guidance_mode=args.guidance_mode,

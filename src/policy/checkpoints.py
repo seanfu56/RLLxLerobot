@@ -33,6 +33,8 @@ _TAG_PRIORITY = {"best": 0, "final": 1}
 
 
 def _tag_of(path: Path) -> str:
+    if path.is_dir():
+        return "model"
     return path.stem
 
 
@@ -148,7 +150,52 @@ class RunInfo:
 def read_run_metadata(directory: Path) -> Mapping:
     path = directory / "run.json"
     if not path.is_file():
-        return {}
+        # SmolVLA checkpoints use Hugging Face's directory format and the
+        # local training script writes its small run description separately.
+        local_path = directory / "smolvla_local_config.json"
+        if not local_path.is_file():
+            return {}
+        try:
+            local = json.loads(local_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(local, Mapping):
+            return {}
+        bundle_manifest: Mapping = {}
+        policy_config: Mapping = {}
+        try:
+            parsed = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+            if isinstance(parsed, Mapping):
+                policy_config = parsed
+        except (OSError, json.JSONDecodeError):
+            pass
+        bundle = local.get("bundle")
+        if bundle:
+            try:
+                parsed = json.loads((Path(str(bundle)) / "bundle.json").read_text(encoding="utf-8"))
+                if isinstance(parsed, Mapping):
+                    bundle_manifest = parsed
+            except (OSError, json.JSONDecodeError):
+                pass
+        return {
+            "config": {
+                "policy": "smolvla",
+                "objective": "flow",
+                "chunk_size": local.get("horizon"),
+                "n_action_steps": local.get("n_action_steps"),
+                "num_inference_steps": policy_config.get("num_steps", 10),
+                "goal_conditioned": True,
+                "goal_selection": local.get("goal_selection", "future_uniform"),
+                "goal_window": local.get("goal_window", 10),
+                "goal_frames": local.get("goal_frames", 4),
+                "goal_frame_index": local.get("goal_frame_index", 2),
+                "goal_dropout": 0.0,
+                "image_size": local.get("image_size", bundle_manifest.get("image_size", 224)),
+                "action_names": bundle_manifest.get("joint_names") or bundle_manifest.get("action_names"),
+            },
+            "bundle": local.get("bundle", "?"),
+            "bundle_manifest": bundle_manifest,
+        }
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -214,6 +261,24 @@ def load_run(directory: Path) -> RunInfo | None:
                 modified_s=stat.st_mtime,
             )
         )
+    # Hugging Face policies such as SmolVLA are saved with
+    # ``save_pretrained``: the run directory itself is the checkpoint rather
+    # than a single .pt file.
+    if not entries and (directory / "smolvla_local_config.json").is_file():
+        try:
+            stat = directory.stat()
+        except OSError:
+            return None
+        entries.append(
+            CheckpointInfo(
+                path=directory,
+                run_name=directory.name,
+                tag="model",
+                step=None,
+                size_bytes=stat.st_size,
+                modified_s=stat.st_mtime,
+            )
+        )
     if not entries:
         return None
 
@@ -235,6 +300,12 @@ def discover_runs(root: Path = DEFAULT_MODEL_ROOT) -> list[RunInfo]:
     root = Path(root).expanduser()
     if not root.is_dir():
         return []
+    # ``save_pretrained`` commonly writes one model directly into the selected
+    # output directory (for example the SmolVLA command's default
+    # ``models/smolvla``), rather than creating a nested run directory.
+    direct = load_run(root)
+    if direct is not None and direct.checkpoints and direct.checkpoints[0].path == root:
+        return [direct]
     runs = [run for path in sorted(root.iterdir()) if (run := load_run(path)) is not None]
     return runs
 

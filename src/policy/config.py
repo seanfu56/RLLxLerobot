@@ -126,6 +126,10 @@ class PolicyConfig:
     goal_dropout: float = 0.0
 
     # --- conditioning ---
+    # State-only ablations can disable the image encoder entirely. The dataset
+    # still carries frames for bundle compatibility, but the policy does not
+    # read them or allocate vision parameters.
+    use_vision: bool = True
     use_proprio: bool = True
     # Classifier-free guidance. Training replaces the whole conditioning vector
     # with a learned null embedding at rate ``cond_dropout``, which is what gives

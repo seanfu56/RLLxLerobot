@@ -38,13 +38,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# Policy state/action representation. Position is in metres, EEF Euler rotation
-# is in degrees (as recorded by the Piper logger), and gripper position is in mm.
-# Keep JOINT_NAMES as a compatibility alias: older policy/data tests and tools
-# import this symbol, while the generated metadata now correctly advertises EEF
-# fields rather than joint angles.
+# Policy state/action representations. EEF remains the default for compatibility,
+# but joint targets avoid Euler discontinuities and inference-time numerical IK.
 EEF_NAMES = ("eef.x", "eef.y", "eef.z", "eef.rx", "eef.ry", "eef.rz", "gripper.pos")
+PIPER_JOINT_NAMES = tuple(f"joint_{index}.pos" for index in range(1, 7)) + ("gripper.pos",)
 JOINT_NAMES = EEF_NAMES
+CONTROL_SPACES = {
+    "eef": (EEF_NAMES, ("m", "m", "m", "deg", "deg", "deg", "mm")),
+    "joint": (PIPER_JOINT_NAMES, ("deg", "deg", "deg", "deg", "deg", "deg", "mm")),
+}
 
 # Bundles that span more than one task directory. Anything not listed here is
 # resolved against --raw-root as a task directory of the same name, so a new
@@ -64,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--raw-root", type=Path, default=Path("piper-data/raw"))
     parser.add_argument("--output-root", type=Path, default=Path("piper-data/dataset"))
+    parser.add_argument(
+        "--control-space",
+        choices=tuple(CONTROL_SPACES),
+        default="eef",
+        help="State/action columns to store. Use joint for direct Piper targets without EEF IK.",
+    )
     parser.add_argument(
         "--bundles",
         nargs="+",
@@ -132,7 +140,9 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def load_episode(episode_path: Path) -> tuple[np.ndarray, np.ndarray, dict]:
+def load_episode(
+    episode_path: Path, feature_names: tuple[str, ...] = EEF_NAMES
+) -> tuple[np.ndarray, np.ndarray, dict]:
     """Return (states, actions, meta) for one episode, validating alignment.
 
     ``observations.csv`` holds the *measured* Piper state captured just before
@@ -163,18 +173,18 @@ def load_episode(episode_path: Path) -> tuple[np.ndarray, np.ndarray, dict]:
             raise ValueError(f"{episode_path} action/observation control sequences differ at row {index}")
 
     missing = {
-        kind: [name for name in EEF_NAMES if name not in rows[0]]
+        kind: [name for name in feature_names if name not in rows[0]]
         for kind, rows in (("actions", actions), ("observations", observations))
     }
     missing = {kind: names for kind, names in missing.items() if names}
     if missing:
-        raise ValueError(f"{episode_path} is missing EEF columns: {missing}")
+        raise ValueError(f"{episode_path} is missing requested control columns: {missing}")
 
     state = np.asarray(
-        [[float(row[name]) for name in EEF_NAMES] for row in observations], dtype=np.float32
+        [[float(row[name]) for name in feature_names] for row in observations], dtype=np.float32
     )
     action = np.asarray(
-        [[float(row[name]) for name in EEF_NAMES] for row in actions], dtype=np.float32
+        [[float(row[name]) for name in feature_names] for row in actions], dtype=np.float32
     )
     if not np.isfinite(state).all() or not np.isfinite(action).all():
         raise ValueError(f"{episode_path} contains non-finite state/action values")
@@ -202,7 +212,14 @@ def preprocess_frame(frame_bgr: np.ndarray, image_size: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def build_shard(source_root: Path, shard_dir: Path, image_size: int, force: bool) -> Path:
+def build_shard(
+    source_root: Path,
+    shard_dir: Path,
+    image_size: int,
+    force: bool,
+    control_space: str = "eef",
+) -> Path:
+    feature_names, feature_units = CONTROL_SPACES[control_space]
     marker = shard_dir / "shard.json"
     if marker.is_file() and not force:
         existing = json.loads(marker.read_text(encoding="utf-8"))
@@ -211,11 +228,17 @@ def build_shard(source_root: Path, shard_dir: Path, image_size: int, force: bool
                 f"{shard_dir} was built at image_size={existing.get('image_size')} but "
                 f"{image_size} was requested. Pass --force to rebuild."
             )
+        existing_names = tuple(existing.get("action_names", existing.get("joint_names", ())))
+        if existing_names != feature_names:
+            raise ValueError(
+                f"{shard_dir} stores {existing_names}, not {feature_names}. "
+                "Use a separate --output-root or pass --force to rebuild."
+            )
         print(f"  reuse {shard_dir} ({existing['num_frames']} frames)")
         return shard_dir
 
     episode_paths = discover_episodes(source_root)
-    loaded = [(path, *load_episode(path)) for path in episode_paths]
+    loaded = [(path, *load_episode(path, feature_names)) for path in episode_paths]
     total_frames = sum(len(state) for _, state, _, _ in loaded)
 
     fps_values = {round(float(meta["video_fps_target"]), 3) for _, _, _, meta in loaded}
@@ -230,8 +253,8 @@ def build_shard(source_root: Path, shard_dir: Path, image_size: int, force: bool
         dtype=np.uint8,
         shape=(total_frames, image_size, image_size, 3),
     )
-    states = np.zeros((total_frames, len(JOINT_NAMES)), dtype=np.float32)
-    actions = np.zeros((total_frames, len(JOINT_NAMES)), dtype=np.float32)
+    states = np.zeros((total_frames, len(feature_names)), dtype=np.float32)
+    actions = np.zeros((total_frames, len(feature_names)), dtype=np.float32)
 
     episodes: list[dict] = []
     cursor = 0
@@ -275,11 +298,12 @@ def build_shard(source_root: Path, shard_dir: Path, image_size: int, force: bool
                 "raw_root": str(source_root),
                 "image_size": image_size,
                 "fps": fps,
-                "joint_names": list(EEF_NAMES),
-                "state_names": list(EEF_NAMES),
-                "action_names": list(EEF_NAMES),
-                "state_units": ["m", "m", "m", "deg", "deg", "deg", "mm"],
-                "action_units": ["m", "m", "m", "deg", "deg", "deg", "mm"],
+                "control_space": control_space,
+                "joint_names": list(feature_names),
+                "state_names": list(feature_names),
+                "action_names": list(feature_names),
+                "state_units": list(feature_units),
+                "action_units": list(feature_units),
                 "num_frames": total_frames,
                 "num_episodes": len(episodes),
                 "episodes": episodes,
@@ -304,8 +328,19 @@ def write_bundle(bundle_dir: Path, name: str, shard_dirs: list[Path]) -> None:
     shard_metas = [json.loads((path / "shard.json").read_text(encoding="utf-8")) for path in shard_dirs]
     image_sizes = {meta["image_size"] for meta in shard_metas}
     fps_values = {meta["fps"] for meta in shard_metas}
-    if len(image_sizes) != 1 or len(fps_values) != 1:
+    feature_names = {tuple(meta.get("action_names", meta["joint_names"])) for meta in shard_metas}
+    feature_units = {tuple(meta.get("action_units", ())) for meta in shard_metas}
+    control_spaces = {meta.get("control_space", "eef") for meta in shard_metas}
+    if (
+        len(image_sizes) != 1
+        or len(fps_values) != 1
+        or len(feature_names) != 1
+        or len(feature_units) != 1
+        or len(control_spaces) != 1
+    ):
         raise ValueError(f"Bundle {name} mixes image sizes {image_sizes} or frame rates {fps_values}")
+    names = feature_names.pop()
+    units = feature_units.pop()
 
     states = np.concatenate([np.load(path / "state.npy") for path in shard_dirs], axis=0)
     actions = np.concatenate([np.load(path / "action.npy") for path in shard_dirs], axis=0)
@@ -317,11 +352,12 @@ def write_bundle(bundle_dir: Path, name: str, shard_dirs: list[Path]) -> None:
         "shard_paths_relative_to": "bundle parent directory",
         "image_size": image_sizes.pop(),
         "fps": fps_values.pop(),
-        "joint_names": list(EEF_NAMES),
-        "state_names": list(EEF_NAMES),
-        "action_names": list(EEF_NAMES),
-        "state_units": ["m", "m", "m", "deg", "deg", "deg", "mm"],
-        "action_units": ["m", "m", "m", "deg", "deg", "deg", "mm"],
+        "control_space": control_spaces.pop(),
+        "joint_names": list(names),
+        "state_names": list(names),
+        "action_names": list(names),
+        "state_units": list(units),
+        "action_units": list(units),
         "num_frames": int(sum(meta["num_frames"] for meta in shard_metas)),
         "num_episodes": int(sum(meta["num_episodes"] for meta in shard_metas)),
         "tasks": sorted({episode["task"] for meta in shard_metas for episode in meta["episodes"]}),
@@ -369,7 +405,13 @@ def main() -> None:
 
     for source in needed_sources:
         print(f"shard {source}")
-        build_shard(raw_root / source, shard_root / source, args.image_size, args.force)
+        build_shard(
+            raw_root / source,
+            shard_root / source,
+            args.image_size,
+            args.force,
+            args.control_space,
+        )
 
     for bundle, sources in plan.items():
         write_bundle(output_root / bundle, bundle, [shard_root / source for source in sources])

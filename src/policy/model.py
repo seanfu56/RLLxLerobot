@@ -244,7 +244,7 @@ class ChunkPolicy(nn.Module):
             delta_mask[list(config.absolute_dims)] = 0.0
         self.register_buffer("delta_mask", delta_mask)
 
-        self.rgb_encoder = RgbEncoder(config)
+        self.rgb_encoder = RgbEncoder(config) if config.use_vision else None
         self.global_cond_dim = self._global_cond_dim()
         self.unet = ConditionalUnet1d(config, global_cond_dim=self.global_cond_dim)
 
@@ -266,9 +266,10 @@ class ChunkPolicy(nn.Module):
         observation history - ``policy.goal.GoalChunkPolicy`` - widens the vector
         by overriding this.
         """
-        per_step = self.rgb_encoder.feature_dim + (
-            self.config.state_dim if self.config.use_proprio else 0
-        )
+        vision_dim = self.rgb_encoder.feature_dim if self.rgb_encoder is not None else 0
+        per_step = vision_dim + (self.config.state_dim if self.config.use_proprio else 0)
+        if per_step == 0:
+            raise ValueError("Policy must use vision or proprioception; both are disabled")
         return per_step * self.config.n_obs_steps
 
     def observation_features(self, batch: dict[str, Tensor]) -> Tensor:
@@ -277,13 +278,16 @@ class ChunkPolicy(nn.Module):
         No dropout here: it is applied once to the finished vector, so that a
         subclass appending its own conditioning is dropped along with this.
         """
-        images = batch["image"]  # (B, T, 3, H, W)
-        batch_size, steps = images.shape[:2]
-        features = self.rgb_encoder(images.flatten(0, 1)).reshape(batch_size, steps, -1)
-        parts = [features]
+        parts = []
+        if self.rgb_encoder is not None:
+            images = batch["image"]  # (B, T, 3, H, W)
+            batch_size, steps = images.shape[:2]
+            features = self.rgb_encoder(images.flatten(0, 1)).reshape(batch_size, steps, -1)
+            parts.append(features)
         if self.config.use_proprio:
             state = self.state_normalizer.normalize(batch["state"])  # (B, T, D)
-            parts.append(state.to(features.dtype))
+            dtype = parts[0].dtype if parts else state.dtype
+            parts.append(state.to(dtype))
         return torch.cat(parts, dim=-1).flatten(1)
 
     def apply_cond_dropout(self, context: Tensor) -> Tensor:
@@ -426,7 +430,7 @@ class ChunkPolicy(nn.Module):
 
     def parameter_counts(self) -> dict[str, int]:
         """Per-part parameter counts, for the training banner and run.json."""
-        encoder = sum(p.numel() for p in self.rgb_encoder.parameters())
+        encoder = sum(p.numel() for p in self.rgb_encoder.parameters()) if self.rgb_encoder is not None else 0
         unet = sum(p.numel() for p in self.unet.parameters())
         total = sum(p.numel() for p in self.parameters())
         return {
